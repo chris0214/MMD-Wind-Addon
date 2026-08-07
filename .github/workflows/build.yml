@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DWINDTOOL_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Stage package
+        run: cmake --install build --config Release --prefix dist
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindTool-windows-x64
+          path: dist

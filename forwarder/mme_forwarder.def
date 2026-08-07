@@ -1,0 +1,13 @@
+LIBRARY MMEffect
+EXPORTS
+    Initialize
+    Cleanup
+    OnCreateModel
+    OnDeleteModel
+    OnBeginScene
+    OnEndScene
+    OnDrawPrimitive
+    OnDrawIndexedPrimitive
+    OnLostDevice
+    OnResetDevice
+    OnClear
