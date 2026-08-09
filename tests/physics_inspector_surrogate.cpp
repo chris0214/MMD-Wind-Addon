@@ -46,6 +46,11 @@ constexpr int kTargetGroupNameId = 2039;
 constexpr int kSaveTargetGroupId = 2040;
 constexpr int kApplyTargetGroupId = 2041;
 constexpr int kDeleteTargetGroupId = 2042;
+constexpr int kTargetLayerComboId = 2043;
+constexpr int kRadiusSliderId = 2045;
+constexpr int kCoreRatioSliderId = 2046;
+constexpr int kFalloffTypeComboId = 2047;
+constexpr int kSourceModeComboId = 2049;
 
 int g_cases = 0;
 int g_failures = 0;
@@ -223,6 +228,7 @@ int main(int argc, char** argv) {
     const HWND wind_preset = GetDlgItem(panel, kWindPresetComboId);
     const HWND noise_type = GetDlgItem(panel, kNoiseTypeComboId);
     const HWND target_list = GetDlgItem(panel, kTargetListId);
+    const HWND target_layer = GetDlgItem(panel, kTargetLayerComboId);
     const HWND select_all = GetDlgItem(panel, kSelectAllId);
     const HWND clear_selection = GetDlgItem(panel, kClearSelectionId);
     const HWND invert_selection = GetDlgItem(panel, kInvertSelectionId);
@@ -234,6 +240,23 @@ int main(int argc, char** argv) {
     const HWND save_target_group = GetDlgItem(panel, kSaveTargetGroupId);
     const HWND apply_target_group = GetDlgItem(panel, kApplyTargetGroupId);
     const HWND delete_target_group = GetDlgItem(panel, kDeleteTargetGroupId);
+    const HWND source_mode = GetDlgItem(panel, kSourceModeComboId);
+    const HWND radius = GetDlgItem(panel, kRadiusSliderId);
+    const HWND core_ratio = GetDlgItem(panel, kCoreRatioSliderId);
+    const HWND falloff_type = GetDlgItem(panel, kFalloffTypeComboId);
+    wchar_t wind_page_label[32]{};
+    wchar_t wind_toggle_label[32]{};
+    wchar_t global_source_label[32]{};
+    wchar_t pmx_source_label[32]{};
+    GetWindowTextW(wind_page, wind_page_label, static_cast<int>(std::size(wind_page_label)));
+    GetWindowTextW(
+        wind_enabled,
+        wind_toggle_label,
+        static_cast<int>(std::size(wind_toggle_label)));
+    SendMessageW(
+        source_mode, CB_GETLBTEXT, 0, reinterpret_cast<LPARAM>(global_source_label));
+    SendMessageW(
+        source_mode, CB_GETLBTEXT, 1, reinterpret_cast<LPARAM>(pmx_source_label));
     check(
         wind_enabled != nullptr && strength != nullptr && group != nullptr && field_type != nullptr &&
             direction_preset != nullptr && frequency != nullptr && wind_page != nullptr &&
@@ -242,12 +265,18 @@ int main(int argc, char** argv) {
             gravity_enabled != nullptr && gravity_acceleration != nullptr &&
             set_key != nullptr && delete_key != nullptr && target_page != nullptr &&
             wind_preset != nullptr && noise_type != nullptr && target_list != nullptr &&
+            target_layer != nullptr &&
             select_all != nullptr && clear_selection != nullptr &&
             invert_selection != nullptr && save_json != nullptr &&
             load_json != nullptr && turbulence != nullptr &&
             target_group_combo != nullptr && target_group_name != nullptr &&
             save_target_group != nullptr && apply_target_group != nullptr &&
-            delete_target_group != nullptr,
+            delete_target_group != nullptr && source_mode != nullptr &&
+            radius != nullptr && core_ratio != nullptr && falloff_type != nullptr &&
+            std::wstring(wind_page_label) == L"风力系统" &&
+            std::wstring(wind_toggle_label) == L"启用风力" &&
+            std::wstring(global_source_label) == L"全局风场" &&
+            std::wstring(pmx_source_label) == L"PMX 局部",
         "create focused animated physics controls");
     RECT wind_page_bounds{};
     RECT wind_toggle_bounds{};
@@ -263,12 +292,17 @@ int main(int argc, char** argv) {
         "complete first-show layout before presenting the panel");
     check(
         SendMessageW(strength, TBM_GETPOS, 0, 0) == 30 &&
+            SendMessageW(strength, TBM_GETRANGEMAX, 0, 0) == 1'000 &&
             SendMessageW(turbulence, TBM_GETPOS, 0, 0) == 12 &&
             SendMessageW(frequency, TBM_GETPOS, 0, 0) == 65 &&
             ComboBox_GetCount(group) == 19 && ComboBox_GetCount(field_type) == 8 &&
             ComboBox_GetCount(direction_preset) == 7 &&
-            ComboBox_GetCount(wind_preset) == 7 && ComboBox_GetCount(noise_type) == 5 &&
-            ListBox_GetCount(target_list) == 19,
+            ComboBox_GetCount(wind_preset) == 8 && ComboBox_GetCount(noise_type) == 5 &&
+            ComboBox_GetCount(source_mode) == 2 && ComboBox_GetCurSel(source_mode) == 0 &&
+            ComboBox_GetCount(falloff_type) == 4 &&
+            ComboBox_GetCount(target_layer) == 3 && ListBox_GetCount(target_list) == 19 &&
+            SendMessageW(radius, TBM_GETPOS, 0, 0) == 20 &&
+            SendMessageW(core_ratio, TBM_GETPOS, 0, 0) == 35,
         "initialize professional wind modes, noise and body targets");
     check(
         SendMessageW(linear_damping, TBM_GETPOS, 0, 0) == 5 &&
@@ -291,6 +325,33 @@ int main(int argc, char** argv) {
     pump_messages();
     check(IsWindowVisible(wind_enabled), "return to wind page");
 
+    check(
+        !IsWindowVisible(radius) && !IsWindowVisible(core_ratio) &&
+            !IsWindowEnabled(radius) && !IsWindowEnabled(core_ratio) &&
+            !IsWindowEnabled(falloff_type),
+        "hide PMX-owned radius controls in global mode");
+    ComboBox_SetCurSel(source_mode, 1);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kSourceModeComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(source_mode));
+    check(
+        !IsWindowVisible(radius) && !IsWindowVisible(core_ratio) &&
+            !IsWindowEnabled(radius) && !IsWindowEnabled(core_ratio) &&
+            IsWindowEnabled(falloff_type),
+        "let the PMX wind source own radius while retaining falloff style");
+    ComboBox_SetCurSel(source_mode, 0);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kSourceModeComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(source_mode));
+    check(
+        !IsWindowEnabled(radius) && !IsWindowEnabled(core_ratio) &&
+            !IsWindowEnabled(falloff_type),
+        "restore global wind after checking exclusive source modes");
+
     ComboBox_SetCurSel(wind_preset, 6);
     SendMessageW(
         panel,
@@ -302,6 +363,17 @@ int main(int argc, char** argv) {
             SendMessageW(turbulence, TBM_GETPOS, 0, 0) == 52 &&
             ComboBox_GetCurSel(noise_type) == 2,
         "apply localized hurricane wind preset");
+    ComboBox_SetCurSel(wind_preset, 7);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kWindPresetComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(wind_preset));
+    check(
+        SendMessageW(strength, TBM_GETPOS, 0, 0) == 650 &&
+            SendMessageW(turbulence, TBM_GETPOS, 0, 0) == 65 &&
+            ComboBox_GetCurSel(noise_type) == 2,
+        "apply smooth extreme wind preset without pulse noise");
 
     SendMessageW(target_page, BM_CLICK, 0, 0);
     pump_messages();
@@ -328,6 +400,52 @@ int main(int argc, char** argv) {
     check(
         SendMessageW(target_list, LB_GETSELCOUNT, 0, 0) == 2,
         "shift click selects a continuous rigid-body range");
+    ComboBox_SetCurSel(target_layer, 1);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kTargetLayerComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(target_layer));
+    check(
+        ListBox_GetSel(target_list, 0) > 0,
+        "damping layer starts with its independent all-dynamic target");
+    ListBox_SetSel(target_list, FALSE, -1);
+    ListBox_SetSel(target_list, TRUE, 18);
+    SendMessageW(target_list, LB_SETCARETINDEX, 18, FALSE);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kTargetListId, LBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(target_list));
+    ComboBox_SetCurSel(target_layer, 2);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kTargetLayerComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(target_layer));
+    ListBox_SetSel(target_list, FALSE, -1);
+    ListBox_SetSel(target_list, TRUE, 4);
+    SendMessageW(target_list, LB_SETCARETINDEX, 4, FALSE);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kTargetListId, LBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(target_list));
+    ComboBox_SetCurSel(target_layer, 0);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kTargetLayerComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(target_layer));
+    check(
+        SendMessageW(target_list, LB_GETSELCOUNT, 0, 0) == 2,
+        "wind layer preserves its own multi-body target after layer switches");
+    const std::wstring layered_status = read_status(get_status);
+    check(
+        layered_status.find(L"target_layer\":\"wind") != std::wstring::npos &&
+            layered_status.find(L"damping_target_index\":1") != std::wstring::npos &&
+            layered_status.find(L"gravity_target_index\":3") != std::wstring::npos,
+        "report independent wind, damping and gravity targets");
     SetWindowTextW(target_group_name, L"头发与裙摆");
     SendMessageW(save_target_group, BM_CLICK, 0, 0);
     SendMessageW(clear_selection, BM_CLICK, 0, 0);
@@ -359,7 +477,8 @@ int main(int argc, char** argv) {
         "apply enabled wind on begin scene");
     const std::wstring wind_status = read_status(get_status);
     check(
-        wind_status.find(L"write_backend\":\"bullet_velocity") != std::wstring::npos &&
+        wind_status.find(L"write_backend\":\"bullet_force_accumulator") != std::wstring::npos &&
+        wind_status.find(L"activation_backend\":\"bullet_activate") != std::wstring::npos &&
             wind_status.find(L"mode\":\"animated_physics_control") != std::wstring::npos &&
             wind_status.find(L"wind_enabled\":true") != std::wstring::npos &&
             wind_status.find(L"wind_backend\":\"active") != std::wstring::npos &&
@@ -370,19 +489,72 @@ int main(int argc, char** argv) {
             read_status(get_status).find(L"wind_applied_frames\":2") !=
                 std::wstring::npos,
         "apply wind continuously while the timeline frame is unchanged");
+    SendMessageW(set_key, BM_CLICK, 0, 0);
+    check(
+        read_status(get_status).find(L"keyframes\":1") != std::wstring::npos,
+        "store a nonzero keyed wind before testing source-mode isolation");
+    ComboBox_SetCurSel(source_mode, 1);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kSourceModeComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(source_mode));
+    check(frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE,
+          "keep frame callback healthy while PMX source is missing");
+    const std::wstring missing_pmx_status = read_status(get_status);
+    check(
+        missing_pmx_status.find(L"wind_source\":\"pmx_local") !=
+                std::wstring::npos &&
+            missing_pmx_status.find(L"controller_status\":\"missing") !=
+                std::wstring::npos &&
+            missing_pmx_status.find(L"wind_backend\":\"waiting_for_pmx") !=
+                std::wstring::npos &&
+            missing_pmx_status.find(L"wind_applied_bodies\":0") !=
+                std::wstring::npos,
+        "apply zero wind instead of panel fallback when PMX is missing");
+    check(
+        missing_pmx_status.find(L"controller_count\":0") != std::wstring::npos &&
+            missing_pmx_status.find(L"controller_limit\":16") !=
+                std::wstring::npos,
+        "report multi-controller count and safety limit");
+    ComboBox_SetCurSel(source_mode, 0);
+    SendMessageW(
+        panel,
+        WM_COMMAND,
+        MAKEWPARAM(kSourceModeComboId, CBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(source_mode));
+    check(frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE,
+          "restore global wind immediately after leaving PMX mode");
+    const std::wstring restored_global_status = read_status(get_status);
+    check(
+        restored_global_status.find(L"wind_source\":\"global") !=
+                std::wstring::npos &&
+            restored_global_status.find(L"wind_backend\":\"active") !=
+                std::wstring::npos &&
+            restored_global_status.find(L"wind_applied_bodies\":2") !=
+                std::wstring::npos,
+        "global mode resumes on surrogate rigid bodies after PMX mode");
     SendMessageW(strength, TBM_SETPOS, TRUE, 0);
     SendMessageW(panel, WM_HSCROLL, TB_THUMBPOSITION, reinterpret_cast<LPARAM>(strength));
     check(
         frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE &&
             read_status(get_status).find(L"wind_enabled\":false") != std::wstring::npos &&
-            read_status(get_status).find(L"wind_backend\":\"released") !=
-                std::wstring::npos,
-        "release residual wind velocity when strength reaches zero");
-    check(
-        frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE &&
             read_status(get_status).find(L"wind_backend\":\"off") !=
                 std::wstring::npos,
-        "remain fully stopped after zero-strength release");
+        "stop wind writes immediately when strength reaches zero");
+    check(
+        dispatch(pcs_host::kCommandRefreshPanel) == TRUE &&
+            SendMessageW(strength, TBM_GETPOS, 0, 0) == 0,
+        "keep the visible strength at zero when a keyed value remains nonzero");
+    for (int pass = 0; pass < 9; ++pass) {
+        check(
+            frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE &&
+                read_status(get_status).find(L"wind_backend\":\"off") !=
+                    std::wstring::npos &&
+                read_status(get_status).find(L"wind_applied_bodies\":0") !=
+                    std::wstring::npos,
+            "leave MMD physics untouched on later frames while wind is muted");
+    }
     SendMessageW(strength, TBM_SETPOS, TRUE, 45);
     SendMessageW(panel, WM_HSCROLL, TB_THUMBPOSITION, reinterpret_cast<LPARAM>(strength));
     check(
@@ -391,12 +563,16 @@ int main(int argc, char** argv) {
     check(
         frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE,
         "resume wind after restoring positive strength");
+    SendMessageW(delete_key, BM_CLICK, 0, 0);
+    check(
+        read_status(get_status).find(L"keyframes\":0") != std::wstring::npos,
+        "remove keyed wind after live strength mute regression test");
     SendMessageW(wind_enabled, BM_CLICK, 0, 0);
     check(
         frame_boundary(pcs_host::FrameBoundary::BeginScene) == TRUE &&
-            read_status(get_status).find(L"wind_backend\":\"released") !=
+            read_status(get_status).find(L"wind_backend\":\"off") !=
                 std::wstring::npos,
-        "master wind switch releases residual velocity");
+        "master wind switch stops writes without touching solver velocity");
     SendMessageW(wind_enabled, BM_CLICK, 0, 0);
 
     ListBox_SetSel(target_list, FALSE, -1);

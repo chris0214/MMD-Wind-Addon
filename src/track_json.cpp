@@ -277,7 +277,9 @@ bool read_target_group(const JsonValue& value, TargetGroup& group) {
         return false;
     }
     PhysicsSettings settings;
-    settings.target = group.target;
+    settings.wind_target = group.target;
+    settings.damping_target = group.target;
+    settings.gravity_target = group.target;
     if (!validate_physics_settings(settings)) return false;
     group.name = name->string;
     return true;
@@ -289,6 +291,8 @@ bool read_snapshot(const JsonValue& object, ControlSnapshot& snapshot) {
     if (wind == nullptr || physics == nullptr) return false;
     std::uint32_t field_type = 0;
     std::uint32_t noise_type = 0;
+    std::uint32_t falloff_type = static_cast<std::uint32_t>(
+        snapshot.wind.falloff_type);
     std::uint32_t group_mask = 0;
     if (!read_bool(*wind, "enabled", snapshot.wind.enabled) ||
         !read_u32(*wind, "field_type", field_type) || field_type > static_cast<std::uint32_t>(WindFieldType::Shear) ||
@@ -303,19 +307,50 @@ bool read_snapshot(const JsonValue& object, ControlSnapshot& snapshot) {
         !read_number(*wind, "maximum_speed", snapshot.wind.maximum_speed)) {
         return false;
     }
+    if ((field(*wind, "falloff_type") != nullptr &&
+            (!read_u32(*wind, "falloff_type", falloff_type) ||
+             falloff_type > static_cast<std::uint32_t>(WindFalloffType::Quadratic))) ||
+        (field(*wind, "local_enabled") != nullptr &&
+            !read_bool(*wind, "local_enabled", snapshot.wind.local_enabled)) ||
+        (field(*wind, "controller_enabled") != nullptr &&
+            !read_bool(*wind, "controller_enabled", snapshot.wind.controller_enabled)) ||
+        (field(*wind, "radius") != nullptr &&
+            !read_number(*wind, "radius", snapshot.wind.radius)) ||
+        (field(*wind, "core_ratio") != nullptr &&
+            !read_number(*wind, "core_ratio", snapshot.wind.core_ratio))) {
+        return false;
+    }
     snapshot.wind.field_type = static_cast<WindFieldType>(field_type);
     snapshot.wind.noise_type = static_cast<WindNoiseType>(noise_type);
+    snapshot.wind.falloff_type = static_cast<WindFalloffType>(falloff_type);
     snapshot.wind.collision_group_mask = static_cast<std::uint16_t>(group_mask);
+    normalize_wind_settings(snapshot.wind);
 
-    const JsonValue* target = field(*physics, "target");
+    const JsonValue* legacy_target = field(*physics, "target");
+    const JsonValue* wind_target = field(*physics, "wind_target");
+    const JsonValue* damping_target = field(*physics, "damping_target");
+    const JsonValue* gravity_target = field(*physics, "gravity_target");
     if (!read_bool(*physics, "damping_enabled", snapshot.physics.damping_enabled) ||
         !read_number(*physics, "linear_damping", snapshot.physics.linear_damping) ||
         !read_number(*physics, "angular_damping", snapshot.physics.angular_damping) ||
         !read_bool(*physics, "gravity_enabled", snapshot.physics.gravity_enabled) ||
         !read_vec3(*physics, "gravity_direction", snapshot.physics.gravity_direction) ||
-        !read_number(*physics, "gravity_acceleration", snapshot.physics.gravity_acceleration) ||
-        target == nullptr || !read_target(*target, snapshot.physics.target)) {
+        !read_number(*physics, "gravity_acceleration", snapshot.physics.gravity_acceleration)) {
         return false;
+    }
+    if (wind_target != nullptr || damping_target != nullptr || gravity_target != nullptr) {
+        if (wind_target == nullptr || damping_target == nullptr || gravity_target == nullptr ||
+            !read_target(*wind_target, snapshot.physics.wind_target) ||
+            !read_target(*damping_target, snapshot.physics.damping_target) ||
+            !read_target(*gravity_target, snapshot.physics.gravity_target)) {
+            return false;
+        }
+    } else {
+        TargetSelection target;
+        if (legacy_target == nullptr || !read_target(*legacy_target, target)) return false;
+        snapshot.physics.wind_target = target;
+        snapshot.physics.damping_target = target;
+        snapshot.physics.gravity_target = std::move(target);
     }
     return validate_wind_settings(snapshot.wind) && validate_physics_settings(snapshot.physics);
 }
@@ -362,6 +397,9 @@ void write_snapshot(std::ostringstream& output, const ControlSnapshot& snapshot,
            << pad << "    \"enabled\": " << (snapshot.wind.enabled ? "true" : "false") << ",\n"
            << pad << "    \"field_type\": " << static_cast<unsigned>(snapshot.wind.field_type) << ",\n"
            << pad << "    \"noise_type\": " << static_cast<unsigned>(snapshot.wind.noise_type) << ",\n"
+           << pad << "    \"falloff_type\": " << static_cast<unsigned>(snapshot.wind.falloff_type) << ",\n"
+           << pad << "    \"local_enabled\": " << (snapshot.wind.local_enabled ? "true" : "false") << ",\n"
+           << pad << "    \"controller_enabled\": " << (snapshot.wind.controller_enabled ? "true" : "false") << ",\n"
            << pad << "    \"direction\": ";
     write_vec3(output, snapshot.wind.direction);
     output << ",\n" << pad << "    \"strength\": " << snapshot.wind.strength
@@ -370,7 +408,9 @@ void write_snapshot(std::ostringstream& output, const ControlSnapshot& snapshot,
            << ",\n" << pad << "    \"frequency\": " << snapshot.wind.frequency
            << ",\n" << pad << "    \"center\": ";
     write_vec3(output, snapshot.wind.center);
-    output << ",\n" << pad << "    \"collision_group_mask\": " << snapshot.wind.collision_group_mask
+    output << ",\n" << pad << "    \"radius\": " << snapshot.wind.radius
+           << ",\n" << pad << "    \"core_ratio\": " << snapshot.wind.core_ratio
+           << ",\n" << pad << "    \"collision_group_mask\": " << snapshot.wind.collision_group_mask
            << ",\n" << pad << "    \"maximum_speed\": " << snapshot.wind.maximum_speed
            << "\n" << pad << "  },\n" << pad << "  \"physics\": {\n"
            << pad << "    \"damping_enabled\": " << (snapshot.physics.damping_enabled ? "true" : "false") << ",\n"
@@ -380,8 +420,12 @@ void write_snapshot(std::ostringstream& output, const ControlSnapshot& snapshot,
            << pad << "    \"gravity_direction\": ";
     write_vec3(output, snapshot.physics.gravity_direction);
     output << ",\n" << pad << "    \"gravity_acceleration\": " << snapshot.physics.gravity_acceleration
-           << ",\n" << pad << "    \"target\": ";
-    write_target(output, snapshot.physics.target, indent + 4);
+           << ",\n" << pad << "    \"wind_target\": ";
+    write_target(output, snapshot.physics.wind_target, indent + 4);
+    output << ",\n" << pad << "    \"damping_target\": ";
+    write_target(output, snapshot.physics.damping_target, indent + 4);
+    output << ",\n" << pad << "    \"gravity_target\": ";
+    write_target(output, snapshot.physics.gravity_target, indent + 4);
     output << "\n" << pad << "  }\n" << pad << '}';
 }
 
@@ -400,7 +444,7 @@ std::string serialize_track_json(
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(9);
-    output << "{\n  \"version\": 1,\n  \"current\": ";
+    output << "{\n  \"version\": 3,\n  \"current\": ";
     write_snapshot(output, current, 2);
     output << ",\n  \"keyframes\": [";
     const auto& keys = track.keys();
@@ -448,7 +492,8 @@ bool deserialize_track_json(
     std::uint32_t version = 0;
     const JsonValue* current_value = field(root, "current");
     const JsonValue* keyframes = field(root, "keyframes");
-    if (!read_u32(root, "version", version) || version != 1 || current_value == nullptr ||
+    if (!read_u32(root, "version", version) || version < 1 || version > 3 ||
+        current_value == nullptr ||
         keyframes == nullptr || keyframes->kind != JsonValue::Kind::Array ||
         !read_snapshot(*current_value, current)) {
         error = "unsupported or incomplete physics track document";

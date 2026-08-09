@@ -39,7 +39,9 @@ struct PhysicsSettings {
     bool gravity_enabled = false;
     Vec3 gravity_direction{0.0f, -1.0f, 0.0f};
     float gravity_acceleration = 9.8f;
-    TargetSelection target{};
+    TargetSelection wind_target{};
+    TargetSelection damping_target{};
+    TargetSelection gravity_target{};
 };
 
 struct ControlSnapshot {

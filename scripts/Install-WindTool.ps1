@@ -16,10 +16,18 @@ $activeMmePath = Join-Path $mmdDirectory 'MMEffect.dll'
 $originalMmePath = Join-Path $mmdDirectory 'MMEffect.original.dll'
 $packageForwarder = Join-Path $packageDirectory 'MMEffect.dll'
 $packagePhysics = Join-Path $packageDirectory 'PhysicsControlStudio\MmdPhysicsControlStudio.dll'
+$packageWindSource = Join-Path $packageDirectory 'WindTool\WindTool-WindSource.pmx'
 $physicsDirectory = Join-Path $mmdDirectory 'PhysicsControlStudio'
 $installedPhysics = Join-Path $physicsDirectory 'MmdPhysicsControlStudio.dll'
+$windToolDirectory = Join-Path $mmdDirectory 'WindTool'
+$installedWindSource = Join-Path $windToolDirectory 'WindTool-WindSource.pmx'
 
-foreach ($path in @($exePath, $activeMmePath, $packageForwarder, $packagePhysics)) {
+foreach ($path in @(
+    $exePath,
+    $activeMmePath,
+    $packageForwarder,
+    $packagePhysics,
+    $packageWindSource)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required file is missing: $path"
     }
@@ -50,7 +58,9 @@ if ($originalHash -ne $expectedOriginalMmeHash) {
 }
 
 New-Item -ItemType Directory -Path $physicsDirectory -Force | Out-Null
+New-Item -ItemType Directory -Path $windToolDirectory -Force | Out-Null
 Copy-Item -LiteralPath $packagePhysics -Destination $installedPhysics -Force
+Copy-Item -LiteralPath $packageWindSource -Destination $installedWindSource -Force
 Copy-Item -LiteralPath $packageForwarder -Destination $activeMmePath -Force
 
 [pscustomobject]@{
@@ -58,6 +68,8 @@ Copy-Item -LiteralPath $packageForwarder -Destination $activeMmePath -Force
     HostHash = $exeHash
     ForwarderHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $activeMmePath).Hash
     WindToolHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPhysics).Hash
+    WindSource = $installedWindSource
+    WindSourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedWindSource).Hash
     OriginalMmePreserved = $true
     Status = 'PASS'
 }

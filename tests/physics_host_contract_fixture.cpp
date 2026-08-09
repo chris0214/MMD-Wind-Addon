@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
     if (passed) {
         const std::wstring value(json.data());
         passed = value.find(L"unsupported_name") != std::wstring::npos &&
-            value.find(L"write_backend\":\"bullet_velocity") != std::wstring::npos &&
+            value.find(L"write_backend\":\"bullet_force_accumulator") != std::wstring::npos &&
+            value.find(L"activation_backend\":\"bullet_activate") != std::wstring::npos &&
             value.find(L"wind_enabled\":false") != std::wstring::npos &&
             value.find(L"frame_bridge\":\"inactive") != std::wstring::npos;
     }
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
         std::cerr << "host contract fixture failed\n";
         return 1;
     }
-    std::cout << "PASS exports=9 fail_closed=1 write_backend=bullet_velocity\n";
+    std::cout << "PASS exports=9 fail_closed=1 write_backend=bullet_force_accumulator"
+                 " activation_backend=bullet_activate\n";
     return 0;
 }

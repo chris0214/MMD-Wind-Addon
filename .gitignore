@@ -1,6 +1,9 @@
 /build/
 /out/
 /dist/
+/release/WindTool-*-win64/
+/release/*.zip
+/release/SHA256SUMS*.txt
 /.vs/
 /.vscode/
 /.idea/
@@ -29,4 +32,5 @@ PhysicsControlStudio.json
 *.user.json
 *.pmm
 *.pmx
+!/assets/WindTool-WindSource.pmx
 *.pmd

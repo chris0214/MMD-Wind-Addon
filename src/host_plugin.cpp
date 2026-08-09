@@ -1,12 +1,14 @@
 #include "physics_control_studio/core.hpp"
 #include "physics_control_studio/host_api.hpp"
 #include "physics_control_studio/bullet_runtime_layout.hpp"
+#include "physics_control_studio/model_target.hpp"
 #include "physics_control_studio/physics_track.hpp"
 #include "physics_control_studio/track_json.hpp"
 #include "physics_control_studio/wind.hpp"
 
 #include "mmd_931_mmhack.hpp"
 #include "mmd_931_model.hpp"
+#include "mmd_931_morph_formats.hpp"
 #include "mmd_931_physics_formats.hpp"
 #include "mmd_931_runtime.hpp"
 #include "mmd_931_runtime_access.hpp"
@@ -31,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,17 +47,45 @@ constexpr UINT_PTR kRefreshTimerId = 1;
 constexpr UINT kRefreshIntervalMs = 500;
 constexpr std::uint32_t kMaximumDisplayedItems = 512;
 constexpr std::uint32_t kMaximumWindBodies = 65'536;
+constexpr std::size_t kMaximumWindControllers = 16;
+constexpr std::uint32_t kControllerMissingRescanFrames = 30;
+constexpr std::uint32_t kControllerConnectedRescanFrames = 60;
+constexpr float kMaximumCombinedWindAcceleration = 4'000.0f;
+constexpr float kWindFilterTimeConstant = 0.08f;
 constexpr int kPanelDefaultWidth = 430;
-constexpr int kPanelDefaultHeight = 730;
+constexpr int kPanelDefaultHeight = 840;
 constexpr int kPanelMinimumWidth = 360;
-constexpr int kPanelMinimumHeight = 680;
+constexpr int kPanelMinimumHeight = 780;
 constexpr int kPanelHeaderHeight = 56;
 constexpr int kPanelFooterHeight = 42;
 constexpr int kPanelPadding = 12;
 constexpr int kPanelCornerRadius = 8;
 constexpr int kPanelResizeBorder = 6;
 constexpr int kCloseButtonSize = 32;
-[[maybe_unused]] constexpr std::uintptr_t kForceActivationStateRva = 0x000ed310;
+constexpr std::uint32_t kMaximumControllerMorphs = 4'096;
+constexpr std::uint32_t kMaximumControllerBones = 4'096;
+constexpr int kMaximumPanelWindStrength = 1'000;
+constexpr float kControllerMinimumRadius = 2.0f;
+constexpr float kControllerMaximumRadius = 80.0f;
+constexpr float kControllerMinimumStrengthScale = 0.0f;
+constexpr float kControllerMaximumStrengthScale = 4.0f;
+constexpr float kControllerMinimumCoreRatio = 0.05f;
+constexpr float kControllerMaximumCoreRatio = 0.95f;
+constexpr char kControllerRadiusMorph[] = "WT_Radius";
+constexpr char kControllerStrengthMorph[] = "WT_Strength";
+constexpr char kControllerFalloffMorph[] = "WT_Falloff";
+
+constexpr float controller_strength_scale_from_weight(float weight) noexcept {
+    return kControllerMinimumStrengthScale +
+        (kControllerMaximumStrengthScale - kControllerMinimumStrengthScale) * weight;
+}
+
+static_assert(controller_strength_scale_from_weight(0.0f) == 0.0f);
+static_assert(controller_strength_scale_from_weight(0.25f) == 1.0f);
+static_assert(controller_strength_scale_from_weight(1.0f) == 4.0f);
+// MMD 9.31 x64 btCollisionObject::activate(bool). Unlike forceActivationState
+// at +0xED310, this also clears m_deactivationTime at body +0xF0.
+[[maybe_unused]] constexpr std::uintptr_t kActivateBodyRva = 0x000ed330;
 constexpr wchar_t kPanelClassName[] = L"Mmd931PhysicsControlStudioWindow";
 constexpr wchar_t kRequestMessageName[] = L"Mmd931.PhysicsControlStudio.Request.v1";
 constexpr COLORREF kPanelColor = RGB(23, 25, 29);
@@ -107,12 +138,28 @@ enum ControlId : int {
     kSaveTargetGroupId = 2040,
     kApplyTargetGroupId = 2041,
     kDeleteTargetGroupId = 2042,
+    kTargetLayerComboId = 2043,
+    kRadiusSliderId = 2045,
+    kCoreRatioSliderId = 2046,
+    kFalloffTypeComboId = 2047,
+    kSourceModeComboId = 2049,
 };
 
 enum class PanelPage : std::uint8_t {
     Wind,
     Physics,
     Target,
+};
+
+enum class WindSourceMode : int {
+    Global,
+    PmxLocal,
+};
+
+enum class TargetLayer : std::uint8_t {
+    Wind,
+    Damping,
+    Gravity,
 };
 
 enum class HostStatus : std::uint8_t {
@@ -148,8 +195,11 @@ std::atomic<std::uint64_t> g_wind_applied_frames{0};
 std::atomic<std::uint64_t> g_wind_applied_bodies{0};
 std::atomic<std::int64_t> g_last_wind_qpc{0};
 std::atomic<int> g_wind_backend_status{0};
+std::atomic<int> g_controller_status{0};
+std::atomic<std::uint32_t> g_controller_count{0};
+std::atomic<WindSourceMode> g_wind_source_mode{WindSourceMode::Global};
 std::atomic_bool g_wind_master_enabled{false};
-std::atomic_bool g_wind_was_active{false};
+std::atomic<float> g_wind_master_strength{30.0f};
 std::atomic<std::uint32_t> g_current_frame{0};
 HMENU g_host_menu = nullptr;
 HMENU g_extension_menu = nullptr;
@@ -165,14 +215,31 @@ HBRUSH g_content_brush = nullptr;
 bool g_close_button_hot = false;
 bool g_syncing_controls = false;
 PanelPage g_panel_page = PanelPage::Wind;
+TargetLayer g_target_layer = TargetLayer::Wind;
 int g_wind_preset_selection = 0;
 std::uint32_t g_last_synced_frame = UINT32_MAX;
+int g_last_controller_ui_status = -1;
+int g_last_controller_ui_count = -1;
 std::uint32_t g_selected_key_frame = UINT32_MAX;
 physics_control_studio::WindSettings g_wind_settings{};
 physics_control_studio::PhysicsSettings g_physics_settings{};
 physics_control_studio::PhysicsTrack g_physics_track{};
 std::vector<physics_control_studio::TargetGroup> g_target_groups;
 std::vector<std::uint32_t> g_target_body_indices;
+std::atomic<std::uintptr_t> g_physics_target_model{0};
+std::uintptr_t g_wind_filter_model = 0;
+std::array<std::uintptr_t, kMaximumWindControllers> g_controller_models{};
+std::array<std::array<std::uint32_t, 3>, kMaximumWindControllers>
+    g_controller_morph_indices{};
+std::size_t g_controller_cache_count = 0;
+std::array<std::uintptr_t, 255> g_controller_model_table{};
+bool g_controller_model_table_valid = false;
+std::uint32_t g_controller_scan_cooldown = 0;
+std::vector<std::uint32_t> g_last_damping_body_indices;
+std::uintptr_t g_last_damping_model = 0;
+std::unordered_map<std::uintptr_t, physics_control_studio::Vec3>
+    g_wind_filtered_acceleration;
+double g_wind_time_seconds = 0.0;
 std::uintptr_t g_target_cache_model = 0;
 std::uint32_t g_target_cache_count = UINT32_MAX;
 std::wstring g_track_path;
@@ -181,6 +248,7 @@ HWND g_wind_page = nullptr;
 HWND g_physics_page = nullptr;
 HWND g_target_page = nullptr;
 HWND g_wind_enabled = nullptr;
+HWND g_source_mode_combo = nullptr;
 HWND g_strength_slider = nullptr;
 HWND g_gust_slider = nullptr;
 HWND g_turbulence_slider = nullptr;
@@ -195,8 +263,12 @@ HWND g_direction_z = nullptr;
 HWND g_center_x = nullptr;
 HWND g_center_y = nullptr;
 HWND g_center_z = nullptr;
+HWND g_radius_slider = nullptr;
+HWND g_core_ratio_slider = nullptr;
+HWND g_falloff_type_combo = nullptr;
 HWND g_group_combo = nullptr;
 HWND g_target_list = nullptr;
+HWND g_target_layer_combo = nullptr;
 HWND g_select_all = nullptr;
 HWND g_clear_selection = nullptr;
 HWND g_invert_selection = nullptr;
@@ -219,6 +291,16 @@ HWND g_save_json = nullptr;
 HWND g_load_json = nullptr;
 int g_target_selection_anchor = -1;
 
+void reset_controller_cache() noexcept {
+    g_controller_models.fill(0);
+    for (auto& indices : g_controller_morph_indices) indices.fill(UINT32_MAX);
+    g_controller_cache_count = 0;
+    g_controller_model_table.fill(0);
+    g_controller_model_table_valid = false;
+    g_controller_scan_cooldown = 0;
+    g_controller_count.store(0);
+}
+
 void reset_frame_bridge() noexcept {
     g_ui_thread_id.store(0);
     g_frame_thread_id.store(0);
@@ -229,8 +311,18 @@ void reset_frame_bridge() noexcept {
     g_wind_applied_bodies.store(0);
     g_last_wind_qpc.store(0);
     g_wind_backend_status.store(0);
+    g_controller_status.store(0);
+    g_wind_source_mode.store(WindSourceMode::Global);
     g_wind_master_enabled.store(false);
-    g_wind_was_active.store(false);
+    g_physics_target_model.store(0);
+    g_wind_filter_model = 0;
+    reset_controller_cache();
+    g_last_controller_ui_status = -1;
+    g_last_controller_ui_count = -1;
+    g_last_damping_body_indices.clear();
+    g_last_damping_model = 0;
+    g_wind_filtered_acceleration.clear();
+    g_wind_time_seconds = 0.0;
 }
 
 const wchar_t* frame_bridge_status_wide() noexcept {
@@ -495,15 +587,60 @@ std::string wide_to_utf8(std::wstring_view text) {
     }
 }
 
+WindSourceMode source_mode_from_settings(
+    const physics_control_studio::WindSettings& settings) noexcept {
+    return settings.controller_enabled
+        ? WindSourceMode::PmxLocal
+        : WindSourceMode::Global;
+}
+
+void apply_wind_source_mode(
+    physics_control_studio::WindSettings& settings,
+    WindSourceMode mode) noexcept {
+    const bool pmx_local = mode == WindSourceMode::PmxLocal;
+    settings.local_enabled = pmx_local;
+    settings.controller_enabled = pmx_local;
+}
+
+void reset_wind_source_runtime(WindSourceMode mode) noexcept {
+    g_last_wind_qpc.store(0);
+    g_wind_applied_bodies.store(0);
+    g_wind_backend_status.store(0);
+    g_wind_filter_model = 0;
+    g_wind_filtered_acceleration.clear();
+    g_wind_time_seconds = 0.0;
+    reset_controller_cache();
+    g_controller_status.store(mode == WindSourceMode::PmxLocal ? 1 : 0);
+    g_last_controller_ui_status = -1;
+    g_last_controller_ui_count = -1;
+}
+
 physics_control_studio::ControlSnapshot control_snapshot() noexcept {
     SharedLock lock(g_wind_lock);
-    return {g_wind_settings, g_physics_settings};
+    physics_control_studio::ControlSnapshot snapshot{
+        g_wind_settings, g_physics_settings};
+    apply_wind_source_mode(snapshot.wind, g_wind_source_mode.load());
+    physics_control_studio::normalize_wind_settings(snapshot.wind);
+    return snapshot;
 }
 
 physics_control_studio::ControlSnapshot control_snapshot_for_frame(
     std::uint32_t frame) noexcept {
     SharedLock lock(g_wind_lock);
-    return g_physics_track.evaluate(frame, {g_wind_settings, g_physics_settings});
+    auto snapshot = g_physics_track.evaluate(frame, {g_wind_settings, g_physics_settings});
+    apply_wind_source_mode(snapshot.wind, g_wind_source_mode.load());
+    physics_control_studio::normalize_wind_settings(snapshot.wind);
+    // An enabled wind field with an empty custom target is not actionable. Older
+    // UI builds could write that state when a wind slider changed while the
+    // target list had no selection, so keep active wind usable by falling back
+    // to the documented default: all dynamic bodies.
+    const auto& target = snapshot.physics.wind_target;
+    if (snapshot.wind.enabled &&
+        target.kind == physics_control_studio::TargetKind::CustomSet &&
+        target.collision_group_mask == 0 && target.rigid_body_indices.empty()) {
+        snapshot.physics.wind_target = physics_control_studio::TargetSelection{};
+    }
+    return snapshot;
 }
 
 std::size_t control_key_count() noexcept {
@@ -591,6 +728,7 @@ bool save_track_file() {
         track = g_physics_track;
         target_groups = g_target_groups;
     }
+    apply_wind_source_mode(current.wind, g_wind_source_mode.load());
     if (g_track_path.empty()) g_track_path = default_track_path();
     const bool success = write_utf8_file(
         g_track_path,
@@ -615,6 +753,8 @@ bool load_track_file() {
         g_track_status = L"JSON 格式无效";
         return false;
     }
+    const WindSourceMode source_mode = source_mode_from_settings(current.wind);
+    apply_wind_source_mode(current.wind, source_mode);
     {
         ExclusiveLock lock(g_wind_lock);
         g_wind_settings = current.wind;
@@ -622,7 +762,10 @@ bool load_track_file() {
         g_physics_track = std::move(track);
         g_target_groups = std::move(target_groups);
     }
+    g_wind_source_mode.store(source_mode);
+    reset_wind_source_runtime(source_mode);
     g_wind_master_enabled.store(current.wind.enabled);
+    g_wind_master_strength.store(current.wind.strength);
     g_selected_key_frame = UINT32_MAX;
     g_last_synced_frame = UINT32_MAX;
     g_track_status = L"JSON 已读取";
@@ -639,7 +782,7 @@ const wchar_t* wind_backend_status_wide() noexcept {
     case 0: return L"off";
     case 1: return L"ready";
     case 2: return L"active";
-    case 3: return L"released";
+    case 3: return L"waiting for PMX";
     case -1: return L"invalid settings";
     case -2: return L"read rejected";
     case -3: return L"write rejected";
@@ -653,7 +796,7 @@ const char* wind_backend_status() noexcept {
     case 0: return "off";
     case 1: return "ready";
     case 2: return "active";
-    case 3: return "released";
+    case 3: return "waiting_for_pmx";
     case -1: return "invalid_settings";
     case -2: return "read_rejected";
     case -3: return "write_rejected";
@@ -696,34 +839,598 @@ const char* wind_backend_status() noexcept {
         written == size;
 }
 
+[[maybe_unused]] physics_control_studio::Vec3 smooth_wind_acceleration(
+    std::uintptr_t body,
+    const physics_control_studio::Vec3& raw,
+    float delta_seconds) {
+    const bool valid = std::isfinite(raw.x) && std::isfinite(raw.y) &&
+        std::isfinite(raw.z) && std::isfinite(delta_seconds) &&
+        delta_seconds > 0.0f;
+    if (!valid) {
+        g_wind_filtered_acceleration.erase(body);
+        return {};
+    }
+
+    auto [state, unused_inserted] = g_wind_filtered_acceleration.try_emplace(
+        body, physics_control_studio::Vec3{});
+    (void)unused_inserted;
+    const float alpha = 1.0f - std::exp(
+        -delta_seconds / kWindFilterTimeConstant);
+    auto& filtered = state->second;
+    filtered.x += (raw.x - filtered.x) * alpha;
+    filtered.y += (raw.y - filtered.y) * alpha;
+    filtered.z += (raw.z - filtered.z) * alpha;
+
+    const float filtered_squared = filtered.x * filtered.x +
+        filtered.y * filtered.y + filtered.z * filtered.z;
+    const float raw_squared = raw.x * raw.x + raw.y * raw.y + raw.z * raw.z;
+    if (filtered_squared <= 1.0e-8f && raw_squared <= 1.0e-8f) {
+        g_wind_filtered_acceleration.erase(state);
+        return {};
+    }
+    return filtered;
+}
+
+struct WindControllerSample {
+    physics_control_studio::Vec3 center{};
+    physics_control_studio::Vec3 direction{1.0f, 0.0f, 0.0f};
+    float radius = 20.0f;
+    float strength_scale = 1.0f;
+    float core_ratio = 0.35f;
+};
+
+bool fixed_name_equals(
+    const char* value,
+    std::size_t capacity,
+    std::string_view expected) noexcept {
+    if (expected.size() >= capacity) return false;
+    std::size_t length = 0;
+    while (length < capacity && value[length] != '\0') ++length;
+    return length == expected.size() &&
+        std::memcmp(value, expected.data(), expected.size()) == 0;
+}
+
+bool controller_morph_matches(
+    const mmd931::model::morph::RuntimeMorphRecord& morph,
+    std::string_view expected) noexcept {
+    return fixed_name_equals(morph.name, std::size(morph.name), expected) ||
+        fixed_name_equals(
+            morph.english_name,
+            std::size(morph.english_name),
+            expected);
+}
+
+float controller_weight(
+    const mmd931::model::morph::RuntimeMorphRecord& morph) noexcept {
+    return std::isfinite(morph.weight)
+        ? std::clamp(morph.weight, 0.0f, 1.0f)
+        : 0.0f;
+}
+
+bool checked_record_address(
+    std::uintptr_t base,
+    std::uint32_t index,
+    std::size_t stride,
+    std::uintptr_t& address) noexcept {
+    const auto maximum = (std::numeric_limits<std::uintptr_t>::max)();
+    if (stride != 0 && index > maximum / stride) return false;
+    const std::uintptr_t offset = static_cast<std::uintptr_t>(index) * stride;
+    if (base > maximum - offset) return false;
+    address = base + offset;
+    return true;
+}
+
+bool read_controller_from_model(
+    mmd931::runtime_access::ProcessReader& reader,
+    std::uintptr_t model,
+    std::array<std::uint32_t, 3>& morph_indices,
+    WindControllerSample& sample) {
+    if (model == 0) return false;
+    std::uintptr_t morphs = 0;
+    std::uintptr_t bones = 0;
+    std::uint32_t morph_count = 0;
+    std::uint32_t bone_count = 0;
+    if (!reader.read(
+            model + mmd931::model::state::kMorphs,
+            &morphs,
+            sizeof(morphs)) ||
+        !reader.read(
+            model + mmd931::model::state::kMorphCount,
+            &morph_count,
+            sizeof(morph_count)) ||
+        !reader.read(
+            model + mmd931::model::state::kBones,
+            &bones,
+            sizeof(bones)) ||
+        !reader.read(
+            model + mmd931::model::state::kBoneCount,
+            &bone_count,
+            sizeof(bone_count)) ||
+        morphs == 0 || bones == 0 || morph_count == 0 ||
+        morph_count > kMaximumControllerMorphs || bone_count == 0 ||
+        bone_count > kMaximumControllerBones) {
+        return false;
+    }
+
+    constexpr std::array<std::string_view, 3> names{{
+        kControllerRadiusMorph,
+        kControllerStrengthMorph,
+        kControllerFalloffMorph}};
+    std::array<mmd931::model::morph::RuntimeMorphRecord, 3> records{};
+    bool cached = std::all_of(
+        morph_indices.begin(),
+        morph_indices.end(),
+        [&](std::uint32_t index) { return index < morph_count; });
+    if (cached) {
+        for (std::size_t slot = 0; slot < morph_indices.size(); ++slot) {
+            std::uintptr_t address = 0;
+            if (!checked_record_address(
+                    morphs,
+                    morph_indices[slot],
+                    sizeof(records[slot]),
+                    address) ||
+                !reader.read(address, &records[slot], sizeof(records[slot])) ||
+                !controller_morph_matches(records[slot], names[slot])) {
+                cached = false;
+                break;
+            }
+        }
+    }
+    if (!cached) {
+        morph_indices = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+        for (std::uint32_t index = 0; index < morph_count; ++index) {
+            std::uintptr_t address = 0;
+            mmd931::model::morph::RuntimeMorphRecord morph{};
+            if (!checked_record_address(morphs, index, sizeof(morph), address) ||
+                !reader.read(address, &morph, sizeof(morph))) {
+                return false;
+            }
+            for (std::size_t slot = 0; slot < names.size(); ++slot) {
+                if (morph_indices[slot] == UINT32_MAX &&
+                    controller_morph_matches(morph, names[slot])) {
+                    morph_indices[slot] = index;
+                    records[slot] = morph;
+                }
+            }
+            if (std::none_of(
+                    morph_indices.begin(),
+                    morph_indices.end(),
+                    [](std::uint32_t value) { return value == UINT32_MAX; })) {
+                break;
+            }
+        }
+        if (std::any_of(
+                morph_indices.begin(),
+                morph_indices.end(),
+                [](std::uint32_t value) { return value == UINT32_MAX; })) {
+            return false;
+        }
+    }
+
+    std::uintptr_t matrix_address = 0;
+    if (!checked_record_address(
+            bones,
+            0,
+            mmd931::model::bone::kStride,
+            matrix_address)) {
+        return false;
+    }
+    const auto maximum = (std::numeric_limits<std::uintptr_t>::max)();
+    if (matrix_address > maximum - mmd931::model::bone::kWorldMatrix) return false;
+    matrix_address += mmd931::model::bone::kWorldMatrix;
+    std::array<float, 16> world{};
+    if (!reader.read(matrix_address, world.data(), sizeof(world))) return false;
+
+    sample.center = {world[12], world[13], world[14]};
+    sample.direction = physics_control_studio::normalize_or_zero(
+        {world[0], world[1], world[2]});
+    if (!std::isfinite(sample.center.x) || !std::isfinite(sample.center.y) ||
+        !std::isfinite(sample.center.z) ||
+        sample.direction.x * sample.direction.x +
+                sample.direction.y * sample.direction.y +
+                sample.direction.z * sample.direction.z <=
+            1.0e-8f) {
+        return false;
+    }
+
+    const float radius_weight = controller_weight(records[0]);
+    const float strength_weight = controller_weight(records[1]);
+    const float falloff_weight = controller_weight(records[2]);
+    sample.radius = kControllerMinimumRadius +
+        (kControllerMaximumRadius - kControllerMinimumRadius) * radius_weight;
+    sample.strength_scale = controller_strength_scale_from_weight(strength_weight);
+    sample.core_ratio = kControllerMinimumCoreRatio +
+        (kControllerMaximumCoreRatio - kControllerMinimumCoreRatio) *
+            falloff_weight;
+    return true;
+}
+
+[[maybe_unused]] std::size_t sample_wind_controllers(
+    mmd931::runtime_access::ProcessReader& reader,
+    const std::array<std::uintptr_t, 255>& models,
+    std::array<WindControllerSample, kMaximumWindControllers>& samples) {
+    samples = {};
+    const bool table_changed = !g_controller_model_table_valid ||
+        g_controller_model_table != models;
+    if (!table_changed && g_controller_cache_count > 0) {
+        bool cache_valid = true;
+        for (std::size_t index = 0; index < g_controller_cache_count; ++index) {
+            if (g_controller_models[index] == 0 || !read_controller_from_model(
+                    reader,
+                    g_controller_models[index],
+                    g_controller_morph_indices[index],
+                    samples[index])) {
+                cache_valid = false;
+                break;
+            }
+        }
+        if (cache_valid && g_controller_scan_cooldown > 0) {
+            --g_controller_scan_cooldown;
+            g_controller_count.store(
+                static_cast<std::uint32_t>(g_controller_cache_count));
+            g_controller_status.store(2);
+            return g_controller_cache_count;
+        }
+    }
+
+    if (!table_changed && g_controller_cache_count == 0 &&
+        g_controller_scan_cooldown > 0) {
+        --g_controller_scan_cooldown;
+        g_controller_count.store(0);
+        g_controller_status.store(1);
+        return 0;
+    }
+
+    g_controller_models.fill(0);
+    for (auto& indices : g_controller_morph_indices) indices.fill(UINT32_MAX);
+    g_controller_cache_count = 0;
+    g_controller_model_table = models;
+    g_controller_model_table_valid = true;
+
+    for (const std::uintptr_t model : models) {
+        if (model == 0) continue;
+        if (g_controller_cache_count >= kMaximumWindControllers) break;
+        std::array<std::uint32_t, 3> indices{
+            UINT32_MAX, UINT32_MAX, UINT32_MAX};
+        WindControllerSample sample{};
+        if (read_controller_from_model(reader, model, indices, sample)) {
+            const std::size_t slot = g_controller_cache_count++;
+            g_controller_models[slot] = model;
+            g_controller_morph_indices[slot] = indices;
+            samples[slot] = sample;
+        }
+    }
+
+    g_controller_count.store(
+        static_cast<std::uint32_t>(g_controller_cache_count));
+    if (g_controller_cache_count > 0) {
+        g_controller_scan_cooldown = kControllerConnectedRescanFrames;
+        g_controller_status.store(2);
+        return g_controller_cache_count;
+    }
+    g_controller_scan_cooldown = kControllerMissingRescanFrames;
+    g_controller_status.store(1);
+    return 0;
+}
+
+struct PhysicsTargetModel {
+    std::uintptr_t model = 0;
+    std::uintptr_t rigid_bodies = 0;
+    std::uint32_t rigid_body_count = 0;
+};
+
+[[maybe_unused]] bool read_physics_target_model(
+    mmd931::runtime_access::ProcessReader& reader,
+    std::uintptr_t model,
+    PhysicsTargetModel& target) {
+    target = {};
+    if (model == 0) return false;
+    std::uintptr_t rigid_bodies = 0;
+    std::uint32_t rigid_body_count = 0;
+    if (!reader.read(
+            model + mmd931::model::state::kRigidBodies,
+            &rigid_bodies,
+            sizeof(rigid_bodies)) ||
+        !reader.read(
+            model + mmd931::model::state::kRigidBodyCount,
+            &rigid_body_count,
+            sizeof(rigid_body_count)) ||
+        rigid_bodies == 0 || rigid_body_count == 0 ||
+        rigid_body_count > kMaximumWindBodies) {
+        return false;
+    }
+    target = {model, rigid_bodies, rigid_body_count};
+    return true;
+}
+
+[[maybe_unused]] PhysicsTargetModel resolve_physics_target_model(
+    mmd931::runtime_access::ProcessReader& reader,
+    std::uint8_t selected_model,
+    const std::array<std::uintptr_t, 255>& models) {
+    PhysicsTargetModel resolved{};
+    const std::uintptr_t model =
+        physics_control_studio::select_physics_target_model(
+            static_cast<std::size_t>(selected_model),
+            g_physics_target_model.load(),
+            models,
+            [&](std::uintptr_t candidate) {
+                PhysicsTargetModel target{};
+                if (!read_physics_target_model(reader, candidate, target)) {
+                    return false;
+                }
+                resolved = target;
+                return true;
+            });
+    if (model == 0) resolved = {};
+    g_physics_target_model.store(model);
+    return resolved;
+}
+
 struct PendingBodyWrite {
     void* body = nullptr;
     std::uintptr_t velocity_address = 0;
     std::array<float, 4> original_velocity{};
     std::array<float, 4> updated_velocity{};
+    std::uintptr_t angular_velocity_address = 0;
+    std::array<float, 4> original_angular_velocity{};
+    std::array<float, 4> updated_angular_velocity{};
+    std::uintptr_t interpolation_velocity_address = 0;
+    std::array<float, 4> original_interpolation_velocity{};
+    std::array<float, 4> updated_interpolation_velocity{};
+    std::uintptr_t interpolation_angular_velocity_address = 0;
+    std::array<float, 4> original_interpolation_angular_velocity{};
+    std::array<float, 4> updated_interpolation_angular_velocity{};
+    std::uintptr_t force_address = 0;
+    std::array<float, 4> original_force{};
+    std::array<float, 4> updated_force{};
     std::uintptr_t damping_address = 0;
     std::array<float, 2> original_damping{};
     std::array<float, 2> updated_damping{};
     bool write_velocity = false;
+    bool write_angular_velocity = false;
+    bool write_interpolation_velocity = false;
+    bool write_interpolation_angular_velocity = false;
+    bool write_force = false;
     bool write_damping = false;
 };
 
+bool has_activation_write(const PendingBodyWrite& write) noexcept {
+    return write.write_velocity || write.write_angular_velocity ||
+        write.write_interpolation_velocity ||
+        write.write_interpolation_angular_velocity || write.write_force;
+}
+
+void restore_body_write(const PendingBodyWrite& write) noexcept {
+    if (write.write_velocity) write_process_exact(
+        write.velocity_address,
+        write.original_velocity.data(),
+        sizeof(write.original_velocity));
+    if (write.write_angular_velocity) write_process_exact(
+        write.angular_velocity_address,
+        write.original_angular_velocity.data(),
+        sizeof(write.original_angular_velocity));
+    if (write.write_interpolation_velocity) write_process_exact(
+        write.interpolation_velocity_address,
+        write.original_interpolation_velocity.data(),
+        sizeof(write.original_interpolation_velocity));
+    if (write.write_interpolation_angular_velocity) write_process_exact(
+        write.interpolation_angular_velocity_address,
+        write.original_interpolation_angular_velocity.data(),
+        sizeof(write.original_interpolation_angular_velocity));
+    if (write.write_force) write_process_exact(
+        write.force_address,
+        write.original_force.data(),
+        sizeof(write.original_force));
+    if (write.write_damping) write_process_exact(
+        write.damping_address,
+        write.original_damping.data(),
+        sizeof(write.original_damping));
+}
+
+bool commit_body_writes(
+    std::vector<PendingBodyWrite>& writes,
+    std::uintptr_t base) noexcept {
+    std::size_t completed = 0;
+    for (; completed < writes.size(); ++completed) {
+        auto& current = writes[completed];
+        const bool velocity_ok = !current.write_velocity || write_process_exact(
+            current.velocity_address,
+            current.updated_velocity.data(),
+            sizeof(current.updated_velocity));
+        const bool angular_ok = velocity_ok &&
+            (!current.write_angular_velocity || write_process_exact(
+                current.angular_velocity_address,
+                current.updated_angular_velocity.data(),
+                sizeof(current.updated_angular_velocity)));
+        const bool interpolation_ok = angular_ok &&
+            (!current.write_interpolation_velocity || write_process_exact(
+                current.interpolation_velocity_address,
+                current.updated_interpolation_velocity.data(),
+                sizeof(current.updated_interpolation_velocity)));
+        const bool interpolation_angular_ok = interpolation_ok &&
+            (!current.write_interpolation_angular_velocity || write_process_exact(
+                current.interpolation_angular_velocity_address,
+                current.updated_interpolation_angular_velocity.data(),
+                sizeof(current.updated_interpolation_angular_velocity)));
+        const bool force_ok = interpolation_angular_ok &&
+            (!current.write_force || write_process_exact(
+                current.force_address,
+                current.updated_force.data(),
+                sizeof(current.updated_force)));
+        const bool damping_ok = force_ok &&
+            (!current.write_damping || write_process_exact(
+                current.damping_address,
+                current.updated_damping.data(),
+                sizeof(current.updated_damping)));
+        if (!damping_ok) {
+            restore_body_write(current);
+            for (std::size_t rollback = 0; rollback < completed; ++rollback) {
+                restore_body_write(writes[rollback]);
+            }
+            return false;
+        }
+    }
+
+    using ActivationFunction = void (*)(void*, bool);
+    const auto activate = reinterpret_cast<ActivationFunction>(
+        base + kActivateBodyRva);
+    for (const auto& write : writes) {
+        if (has_activation_write(write)) activate(write.body, false);
+    }
+    return true;
+}
+
+std::array<float, 2> native_damping_values(
+    const mmd931::model::physics::RigidBodyRecord& record) noexcept {
+    const auto clamp_damping = [](float value) noexcept {
+        return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+    };
+    return {
+        clamp_damping(record.linear_damping),
+        clamp_damping(record.angular_damping)};
+}
+
+bool prepare_damping_write(
+    mmd931::runtime_access::ProcessReader& reader,
+    std::uintptr_t body,
+    const std::array<float, 2>& damping,
+    PendingBodyWrite& pending) noexcept {
+    pending.body = reinterpret_cast<void*>(body);
+    pending.damping_address =
+        body + physics_control_studio::bullet_runtime_layout::kLinearDamping;
+    if (!reader.read(
+            pending.damping_address,
+            pending.original_damping.data(),
+            sizeof(pending.original_damping))) {
+        return false;
+    }
+    pending.updated_damping = damping;
+    pending.write_damping = true;
+    return writable_range(
+        pending.damping_address,
+        sizeof(pending.updated_damping));
+}
+
+[[maybe_unused]] bool restore_native_damping(
+    mmd931::runtime_access::ProcessReader& reader,
+    std::uintptr_t base,
+    const std::array<std::uintptr_t, 255>& models,
+    std::uintptr_t model,
+    const std::vector<std::uint32_t>& body_indices,
+    std::size_t& restored_bodies) {
+    restored_bodies = 0;
+    if (model == 0 || body_indices.empty() ||
+        std::find(models.begin(), models.end(), model) == models.end()) {
+        return true;
+    }
+
+    std::uintptr_t rigid_bodies = 0;
+    std::uint32_t rigid_body_count = 0;
+    if (!reader.read(
+            model + mmd931::model::state::kRigidBodies,
+            &rigid_bodies,
+            sizeof(rigid_bodies)) ||
+        !reader.read(
+            model + mmd931::model::state::kRigidBodyCount,
+            &rigid_body_count,
+            sizeof(rigid_body_count)) ||
+        rigid_bodies == 0 || rigid_body_count > kMaximumWindBodies) {
+        return false;
+    }
+
+    std::vector<PendingBodyWrite> writes;
+    writes.reserve(body_indices.size());
+    for (const std::uint32_t index : body_indices) {
+        if (index >= rigid_body_count) continue;
+        mmd931::model::physics::RigidBodyRecord record{};
+        if (!reader.read(
+                rigid_bodies + static_cast<std::uintptr_t>(index) * sizeof(record),
+                &record,
+                sizeof(record))) {
+            return false;
+        }
+        const std::uintptr_t body = static_cast<std::uintptr_t>(record.runtime_object);
+        if (body == 0) continue;
+        PendingBodyWrite pending{};
+        if (!prepare_damping_write(
+                reader,
+                body,
+                native_damping_values(record),
+                pending)) {
+            return false;
+        }
+        writes.push_back(pending);
+    }
+    if (!commit_body_writes(writes, base)) return false;
+    restored_bodies = writes.size();
+    return true;
+}
+
+bool restore_tracked_damping_overrides() noexcept {
+#ifdef PCS_SURROGATE_HOST
+    g_last_damping_body_indices.clear();
+    g_last_damping_model = 0;
+    return true;
+#else
+    if (g_last_damping_model == 0 || g_last_damping_body_indices.empty()) {
+        return true;
+    }
+
+    mmd931::runtime_access::ProcessReader reader(GetCurrentProcess());
+    const std::uintptr_t base =
+        reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    std::uintptr_t state = 0;
+    std::array<std::uintptr_t, 255> models{};
+    if (!reader.read(base + mmd931::runtime::kMainStatePointerRva, &state, sizeof(state)) ||
+        state == 0 ||
+        !reader.read(
+            state + mmd931::runtime_access::main_state::kModelTable,
+            models.data(),
+            sizeof(models))) {
+        return false;
+    }
+
+    std::size_t restored_bodies = 0;
+    if (!restore_native_damping(
+            reader,
+            base,
+            models,
+            g_last_damping_model,
+            g_last_damping_body_indices,
+            restored_bodies)) {
+        return false;
+    }
+    g_last_damping_body_indices.clear();
+    g_last_damping_model = 0;
+    return true;
+#endif
+}
+
 bool wind_effect_active(const physics_control_studio::WindSettings& wind) noexcept {
-    return g_wind_master_enabled.load() && wind.enabled && wind.strength > 0.0001f;
+    return g_wind_master_enabled.load() && g_wind_master_strength.load() > 0.0001f &&
+        wind.enabled && wind.strength > 0.0001f;
+}
+
+float displayed_wind_strength(
+    const physics_control_studio::WindSettings& wind) noexcept {
+    return g_wind_master_strength.load() > 0.0001f ? wind.strength : 0.0f;
 }
 
 bool apply_physics_frame() {
 #ifdef PCS_SURROGATE_HOST
     g_current_frame.store(0);
     const auto controls = control_snapshot_for_frame(0);
-    const bool wind_active = wind_effect_active(controls.wind);
-    const bool release_wind = g_wind_was_active.load() && !wind_active;
-    if (!wind_active && !release_wind && !controls.physics.damping_enabled &&
+    const bool requested_wind_active = wind_effect_active(controls.wind);
+    const bool controller_missing = requested_wind_active &&
+        g_wind_source_mode.load() == WindSourceMode::PmxLocal;
+    const bool wind_active = requested_wind_active && !controller_missing;
+    g_controller_status.store(controller_missing ? 1 : 0);
+    g_controller_count.store(0);
+    if (!wind_active && !controls.physics.damping_enabled &&
         !controls.physics.gravity_enabled) {
         g_last_wind_qpc.store(0);
         g_wind_applied_bodies.store(0);
-        g_wind_backend_status.store(0);
-        g_wind_was_active.store(false);
+        g_wind_backend_status.store(controller_missing ? 3 : 0);
         return true;
     }
     if (!physics_control_studio::validate_wind_settings(controls.wind) ||
@@ -731,10 +1438,14 @@ bool apply_physics_frame() {
         g_wind_backend_status.store(-1);
         return false;
     }
-    g_wind_applied_frames.fetch_add(1);
-    g_wind_applied_bodies.store(2);
-    g_wind_backend_status.store(release_wind ? 3 : 2);
-    g_wind_was_active.store(wind_active);
+    if (wind_active) {
+        g_wind_applied_frames.fetch_add(1);
+        g_wind_applied_bodies.store(2);
+        g_wind_backend_status.store(2);
+    } else {
+        g_wind_applied_bodies.store(0);
+        g_wind_backend_status.store(controller_missing ? 3 : 1);
+    }
     return true;
 #else
     if (g_host_status.load() != HostStatus::Supported) {
@@ -781,18 +1492,84 @@ bool apply_physics_frame() {
     const auto controls = control_snapshot_for_frame(current_frame);
     if (!physics_control_studio::validate_wind_settings(controls.wind) ||
         !physics_control_studio::validate_physics_settings(controls.physics)) {
+        g_wind_filtered_acceleration.clear();
+        g_wind_time_seconds = 0.0;
         g_wind_backend_status.store(-1);
         return false;
     }
-    const bool wind_active = wind_effect_active(controls.wind);
-    const bool release_wind = g_wind_was_active.load() && !wind_active;
-    const bool timed_velocity_control = wind_active || controls.physics.gravity_enabled;
-    const bool velocity_control = timed_velocity_control || release_wind;
-    if (!velocity_control && !controls.physics.damping_enabled) {
+    auto wind = controls.wind;
+    wind.collision_group_mask = 0xffff;
+    const bool requested_wind_active = wind_effect_active(wind);
+    std::array<physics_control_studio::WindSettings, kMaximumWindControllers>
+        wind_sources{};
+    std::size_t wind_source_count = 0;
+    bool controller_ready = !wind.controller_enabled;
+    if (requested_wind_active && wind.controller_enabled) {
+        std::array<WindControllerSample, kMaximumWindControllers> controllers{};
+        const std::size_t controller_count = sample_wind_controllers(
+            reader, models, controllers);
+        controller_ready = controller_count > 0;
+        for (std::size_t index = 0; index < controller_count; ++index) {
+            auto source = wind;
+            source.center = controllers[index].center;
+            source.direction = controllers[index].direction;
+            source.radius = controllers[index].radius;
+            source.core_ratio = controllers[index].core_ratio;
+            source.strength *= controllers[index].strength_scale;
+            if (!physics_control_studio::validate_wind_settings(source)) {
+                g_wind_filtered_acceleration.clear();
+                g_wind_time_seconds = 0.0;
+                g_wind_backend_status.store(-1);
+                return false;
+            }
+            wind_sources[wind_source_count++] = source;
+        }
+    } else {
+        g_controller_status.store(0);
+        g_controller_count.store(0);
+        if (!wind.controller_enabled) wind_sources[wind_source_count++] = wind;
+    }
+    const bool controller_missing = requested_wind_active &&
+        wind.controller_enabled && !controller_ready;
+    const bool wind_active = requested_wind_active && controller_ready;
+    const bool damping_active = controls.physics.damping_enabled;
+    const bool gravity_active = controls.physics.gravity_enabled;
+    const PhysicsTargetModel physics_target =
+        resolve_physics_target_model(reader, selected_model, models);
+
+    // Bullet clears the total-force accumulator after each simulation step.
+    // Muting wind therefore only stops new force writes and leaves velocity to MMD.
+    if (!wind_active || g_wind_filter_model != physics_target.model) {
+        g_wind_filtered_acceleration.clear();
+        g_wind_filter_model = wind_active ? physics_target.model : 0;
+    }
+
+    // Runtime damping is persistent, so return bodies to their PMX values when
+    // this plugin no longer owns the previous model or target set.
+    if (g_last_damping_model != 0 &&
+        (!damping_active || g_last_damping_model != physics_target.model)) {
+        std::size_t restored_bodies = 0;
+        if (!restore_native_damping(
+                reader,
+                base,
+                models,
+                g_last_damping_model,
+                g_last_damping_body_indices,
+                restored_bodies)) {
+            g_wind_backend_status.store(-2);
+            return false;
+        }
+        g_last_damping_body_indices.clear();
+        g_last_damping_model = 0;
+    }
+
+    const bool timed_velocity_control = wind_active || gravity_active;
+    const bool current_control_active = timed_velocity_control || damping_active;
+    if (!current_control_active) {
         g_last_wind_qpc.store(0);
+        g_wind_time_seconds = 0.0;
         g_wind_applied_bodies.store(0);
-        g_wind_backend_status.store(0);
-        g_wind_was_active.store(false);
+        g_wind_backend_status.store(controller_missing ? 3 : 0);
         return true;
     }
 
@@ -812,38 +1589,41 @@ bool apply_physics_frame() {
         : 1.0 / 60.0;
     const float delta_seconds = static_cast<float>(
         std::clamp(elapsed_seconds, 1.0 / 1000.0, 1.0 / 15.0));
-    const double time_seconds = static_cast<double>(counter.QuadPart) /
-        static_cast<double>(frequency.QuadPart > 0 ? frequency.QuadPart : 1);
+    if (wind_active) {
+        g_wind_time_seconds += static_cast<double>(delta_seconds);
+        if (!std::isfinite(g_wind_time_seconds)) {
+            g_wind_time_seconds = 0.0;
+            g_wind_filtered_acceleration.clear();
+        }
+    } else {
+        // Gravity and damping may remain active while the wind is muted; do
+        // not carry a stale wind phase or filtered acceleration into the next
+        // activation.
+        g_wind_time_seconds = 0.0;
+        g_wind_filtered_acceleration.clear();
+    }
+    const double time_seconds = g_wind_time_seconds;
 
-    if (selected_model >= models.size() || models[selected_model] == 0) {
+    if (physics_target.model == 0) {
         g_wind_applied_bodies.store(0);
-        g_wind_backend_status.store(1);
-        g_wind_was_active.store(wind_active);
+        g_wind_backend_status.store(controller_missing ? 3 : 1);
         return true;
     }
 
-    const std::uintptr_t model = models[selected_model];
-    [[maybe_unused]] std::uintptr_t rigid_bodies = 0;
-    std::uint32_t rigid_body_count = 0;
-    if (!reader.read(
-            model + mmd931::model::state::kRigidBodies,
-            &rigid_bodies,
-            sizeof(rigid_bodies)) ||
-        !reader.read(
-            model + mmd931::model::state::kRigidBodyCount,
-            &rigid_body_count,
-            sizeof(rigid_body_count)) ||
-        rigid_bodies == 0 ||
-        rigid_body_count > kMaximumWindBodies) {
-        g_wind_backend_status.store(-2);
-        return false;
-    }
+    const std::uintptr_t model = physics_target.model;
+    const std::uintptr_t rigid_bodies = physics_target.rigid_bodies;
+    const std::uint32_t rigid_body_count = physics_target.rigid_body_count;
 
     std::vector<PendingBodyWrite> writes;
     writes.reserve(rigid_body_count);
+    std::vector<std::uint32_t> next_damping_body_indices;
+    next_damping_body_indices.reserve(rigid_body_count);
+    const std::vector<std::uint32_t> previous_damping_body_indices =
+        g_last_damping_model == model
+        ? g_last_damping_body_indices
+        : std::vector<std::uint32_t>{};
+    std::size_t wind_applied_bodies = 0;
 
-    auto wind = controls.wind;
-    wind.collision_group_mask = 0xffff;
     const auto native_direction = physics_control_studio::normalize_or_zero({
         native_gravity_direction[0],
         native_gravity_direction[1],
@@ -869,29 +1649,55 @@ bool apply_physics_frame() {
         }
         const bool dynamic_body =
             record.mode != mmd931::model::physics::BodyMode::BoneSynchronized;
-        if (record.runtime_object == 0 || !physics_control_studio::target_matches(
-                controls.physics.target,
+        const bool wind_target = physics_control_studio::target_matches(
+            controls.physics.wind_target,
+            index,
+            record.collision_group,
+            dynamic_body);
+        const bool damping_target = controls.physics.damping_enabled &&
+            physics_control_studio::target_matches(
+                controls.physics.damping_target,
                 index,
                 record.collision_group,
-                dynamic_body)) {
+                dynamic_body);
+        const bool damping_was_overridden = std::binary_search(
+            previous_damping_body_indices.begin(),
+            previous_damping_body_indices.end(),
+            index);
+        const bool gravity_target = controls.physics.gravity_enabled &&
+            physics_control_studio::target_matches(
+                controls.physics.gravity_target,
+                index,
+                record.collision_group,
+                dynamic_body);
+        const bool apply_wind = wind_active && wind_target;
+        const bool needs_velocity_sample = apply_wind || gravity_target;
+        const std::uintptr_t body = static_cast<std::uintptr_t>(record.runtime_object);
+        if (body == 0) {
+            if (damping_target || damping_was_overridden) {
+                next_damping_body_indices.push_back(index);
+            }
+            continue;
+        }
+        if (!apply_wind) g_wind_filtered_acceleration.erase(body);
+        if (damping_target) next_damping_body_indices.push_back(index);
+        if (!needs_velocity_sample && !damping_target && !damping_was_overridden) {
             continue;
         }
 
-        const std::uintptr_t body = static_cast<std::uintptr_t>(record.runtime_object);
         PendingBodyWrite pending{};
         pending.body = reinterpret_cast<void*>(body);
         pending.velocity_address =
             body + physics_control_studio::bullet_runtime_layout::kLinearVelocity;
-        pending.damping_address =
-            body + physics_control_studio::bullet_runtime_layout::kLinearDamping;
+        pending.force_address =
+            body + physics_control_studio::bullet_runtime_layout::kTotalForce;
 
-        if (velocity_control) {
+        if (needs_velocity_sample) {
             std::array<float, 4> position{};
-            if (!reader.read(
+            if ((apply_wind && !reader.read(
                     body + physics_control_studio::bullet_runtime_layout::kWorldPosition,
                     position.data(),
-                    sizeof(position)) ||
-                !reader.read(
+                    sizeof(position))) || !reader.read(
                     pending.velocity_address,
                     pending.original_velocity.data(),
                     sizeof(pending.original_velocity))) {
@@ -902,37 +1708,108 @@ bool apply_physics_frame() {
                 pending.original_velocity[0],
                 pending.original_velocity[1],
                 pending.original_velocity[2]};
-            if (release_wind) {
-                velocity = {};
-            } else if (wind_active) {
+            if (apply_wind) {
                 physics_control_studio::WindBodySample sample{};
                 sample.body_mode = static_cast<std::uint8_t>(record.mode);
                 sample.collision_group = record.collision_group;
                 sample.position = {position[0], position[1], position[2]};
                 sample.linear_velocity = velocity;
-                const auto evaluated = physics_control_studio::evaluate_wind(
-                    wind, sample, time_seconds, delta_seconds);
-                if (evaluated.affected) velocity = evaluated.linear_velocity;
+                std::array<physics_control_studio::Vec3, kMaximumWindControllers>
+                    accelerations{};
+                std::size_t acceleration_count = 0;
+                for (std::size_t source_index = 0;
+                     source_index < wind_source_count;
+                     ++source_index) {
+                    const auto evaluated = physics_control_studio::evaluate_wind(
+                        wind_sources[source_index],
+                        sample,
+                        time_seconds,
+                        delta_seconds);
+                    const float squared = evaluated.acceleration.x *
+                            evaluated.acceleration.x +
+                        evaluated.acceleration.y * evaluated.acceleration.y +
+                        evaluated.acceleration.z * evaluated.acceleration.z;
+                    if (evaluated.affected && squared > 1.0e-8f) {
+                        accelerations[acceleration_count++] = evaluated.acceleration;
+                    }
+                }
+                physics_control_studio::Vec3 combined_acceleration{};
+                if (acceleration_count == 1) {
+                    combined_acceleration = accelerations[0];
+                } else if (acceleration_count > 1) {
+                    combined_acceleration =
+                        physics_control_studio::combine_wind_accelerations(
+                            accelerations.data(),
+                            acceleration_count,
+                            kMaximumCombinedWindAcceleration);
+                    combined_acceleration =
+                        physics_control_studio::limit_wind_acceleration_to_speed(
+                            combined_acceleration,
+                            sample.linear_velocity,
+                            delta_seconds,
+                            wind.maximum_speed);
+                }
+                physics_control_studio::Vec3 filtered_acceleration{};
+                const float combined_squared = combined_acceleration.x *
+                        combined_acceleration.x +
+                    combined_acceleration.y * combined_acceleration.y +
+                    combined_acceleration.z * combined_acceleration.z;
+                if (combined_squared > 1.0e-8f) {
+                    ++wind_applied_bodies;
+                    filtered_acceleration = smooth_wind_acceleration(
+                        body, combined_acceleration, delta_seconds);
+                } else {
+                    g_wind_filtered_acceleration.erase(body);
+                }
+                const float acceleration_squared = filtered_acceleration.x *
+                        filtered_acceleration.x +
+                    filtered_acceleration.y * filtered_acceleration.y +
+                    filtered_acceleration.z * filtered_acceleration.z;
+                if (acceleration_squared > 1.0e-8f &&
+                    std::isfinite(record.mass) && record.mass > 1.0e-6f) {
+                    if (!reader.read(
+                            pending.force_address,
+                            pending.original_force.data(),
+                            sizeof(pending.original_force))) {
+                        g_wind_backend_status.store(-2);
+                        return false;
+                    }
+                    pending.updated_force = pending.original_force;
+                    pending.updated_force[0] += filtered_acceleration.x * record.mass;
+                    pending.updated_force[1] += filtered_acceleration.y * record.mass;
+                    pending.updated_force[2] += filtered_acceleration.z * record.mass;
+                    pending.write_force = true;
+                    if (!writable_range(
+                            pending.force_address,
+                            sizeof(pending.updated_force))) {
+                        g_wind_backend_status.store(-3);
+                        return false;
+                    }
+                }
             }
-            if (controls.physics.gravity_enabled) {
+            if (gravity_target) {
                 velocity.x += gravity_delta.x * delta_seconds;
                 velocity.y += gravity_delta.y * delta_seconds;
                 velocity.z += gravity_delta.z * delta_seconds;
+                pending.write_velocity = true;
             }
-            pending.updated_velocity = {
-                velocity.x,
-                velocity.y,
-                velocity.z,
-                pending.original_velocity[3]};
-            pending.write_velocity = true;
-            if (!writable_range(
-                    pending.velocity_address,
-                    sizeof(pending.updated_velocity))) {
-                g_wind_backend_status.store(-3);
-                return false;
+            if (pending.write_velocity) {
+                pending.updated_velocity = {
+                    velocity.x,
+                    velocity.y,
+                    velocity.z,
+                    pending.original_velocity[3]};
+                if (!writable_range(
+                        pending.velocity_address,
+                        sizeof(pending.updated_velocity))) {
+                    g_wind_backend_status.store(-3);
+                    return false;
+                }
             }
         }
-        if (controls.physics.damping_enabled) {
+        if (damping_target || damping_was_overridden) {
+            pending.damping_address =
+                body + physics_control_studio::bullet_runtime_layout::kLinearDamping;
             if (!reader.read(
                     pending.damping_address,
                     pending.original_damping.data(),
@@ -940,9 +1817,11 @@ bool apply_physics_frame() {
                 g_wind_backend_status.store(-2);
                 return false;
             }
-            pending.updated_damping = {
-                controls.physics.linear_damping,
-                controls.physics.angular_damping};
+            pending.updated_damping = damping_target
+                ? std::array<float, 2>{
+                    controls.physics.linear_damping,
+                    controls.physics.angular_damping}
+                : native_damping_values(record);
             pending.write_damping = true;
             if (!writable_range(
                     pending.damping_address,
@@ -951,59 +1830,33 @@ bool apply_physics_frame() {
                 return false;
             }
         }
-        writes.push_back(pending);
-    }
-
-    std::size_t completed = 0;
-    for (; completed < writes.size(); ++completed) {
-        auto& current = writes[completed];
-        const bool velocity_ok = !current.write_velocity || write_process_exact(
-            current.velocity_address,
-            current.updated_velocity.data(),
-            sizeof(current.updated_velocity));
-        const bool damping_ok = velocity_ok && (!current.write_damping || write_process_exact(
-            current.damping_address,
-            current.updated_damping.data(),
-            sizeof(current.updated_damping)));
-        if (!velocity_ok || !damping_ok) {
-            if (current.write_velocity) write_process_exact(
-                current.velocity_address,
-                current.original_velocity.data(),
-                sizeof(current.original_velocity));
-            if (current.write_damping) write_process_exact(
-                current.damping_address,
-                current.original_damping.data(),
-                sizeof(current.original_damping));
-            for (std::size_t rollback = 0; rollback < completed; ++rollback) {
-                if (writes[rollback].write_velocity) write_process_exact(
-                    writes[rollback].velocity_address,
-                    writes[rollback].original_velocity.data(),
-                    sizeof(writes[rollback].original_velocity));
-                if (writes[rollback].write_damping) write_process_exact(
-                    writes[rollback].damping_address,
-                    writes[rollback].original_damping.data(),
-                    sizeof(writes[rollback].original_damping));
-            }
-            g_wind_backend_status.store(-3);
-            return false;
+        if (pending.write_velocity || pending.write_force || pending.write_damping) {
+            writes.push_back(pending);
         }
     }
 
-    using ActivationFunction = void (*)(void*, int);
-    const auto activate = reinterpret_cast<ActivationFunction>(
-        base + kForceActivationStateRva);
-    for (const auto& write : writes) {
-        if (write.write_velocity) activate(write.body, 1);
+    if (!commit_body_writes(writes, base)) {
+        g_wind_backend_status.store(-3);
+        return false;
     }
-    if (!writes.empty()) {
+
+    if (damping_active && !next_damping_body_indices.empty()) {
+        g_last_damping_model = model;
+        g_last_damping_body_indices = std::move(next_damping_body_indices);
+    } else {
+        g_last_damping_model = 0;
+        g_last_damping_body_indices.clear();
+    }
+
+    if (wind_active) {
         g_wind_applied_frames.fetch_add(1);
-        g_wind_applied_bodies.store(writes.size());
-        g_wind_backend_status.store(release_wind ? 3 : 2);
+        g_wind_applied_bodies.store(wind_applied_bodies);
+        g_wind_backend_status.store(2);
     } else {
         g_wind_applied_bodies.store(0);
-        g_wind_backend_status.store(1);
+        g_wind_backend_status.store(
+            controller_missing ? 3 : current_control_active ? 1 : 0);
     }
-    g_wind_was_active.store(wind_active);
     return true;
 #endif
 }
@@ -1335,10 +2188,19 @@ void apply_wind_preset(int selection) {
         wind.maximum_speed = 700.0f;
         wind.noise_type = physics_control_studio::WindNoiseType::Fractal;
         break;
+    case 7:
+        wind.strength = 650.0f;
+        wind.gust = 0.85f;
+        wind.turbulence = 0.65f;
+        wind.frequency = 1.90f;
+        wind.maximum_speed = 1'400.0f;
+        wind.noise_type = physics_control_studio::WindNoiseType::Fractal;
+        break;
     default:
         return;
     }
     g_wind_preset_selection = selection;
+    g_wind_master_strength.store(wind.strength);
 }
 
 bool populate_target_combo(bool force = false) {
@@ -1349,6 +2211,7 @@ bool populate_target_combo(bool force = false) {
 #ifdef PCS_SURROGATE_HOST
     model = 1;
     rigid_body_count = 2;
+    g_physics_target_model.store(model);
 #else
     mmd931::runtime_access::ProcessReader reader(GetCurrentProcess());
     const std::uintptr_t base =
@@ -1356,33 +2219,23 @@ bool populate_target_combo(bool force = false) {
     std::uintptr_t state = 0;
     std::uint8_t selected_model = 0;
     std::array<std::uintptr_t, 255> models{};
-    if (reader.read(base + mmd931::runtime::kMainStatePointerRva, &state, sizeof(state)) &&
-        state != 0 &&
-        reader.read(
+    if (!reader.read(base + mmd931::runtime::kMainStatePointerRva, &state, sizeof(state)) ||
+        state == 0 ||
+        !reader.read(
             state + mmd931::runtime_access::main_state::kSelectedModel,
             &selected_model,
-            sizeof(selected_model)) &&
-        reader.read(
+            sizeof(selected_model)) ||
+        !reader.read(
             state + mmd931::runtime_access::main_state::kModelTable,
             models.data(),
-            sizeof(models)) &&
-        selected_model < models.size()) {
-        model = models[selected_model];
-        if (model != 0) {
-            if (!reader.read(
-                    model + mmd931::model::state::kRigidBodies,
-                    &rigid_bodies,
-                    sizeof(rigid_bodies)) ||
-                !reader.read(
-                    model + mmd931::model::state::kRigidBodyCount,
-                    &rigid_body_count,
-                    sizeof(rigid_body_count)) ||
-                rigid_body_count > kMaximumWindBodies) {
-                model = 0;
-                rigid_body_count = 0;
-            }
-        }
+            sizeof(models))) {
+        return false;
     }
+    const PhysicsTargetModel target =
+        resolve_physics_target_model(reader, selected_model, models);
+    model = target.model;
+    rigid_bodies = target.rigid_bodies;
+    rigid_body_count = target.rigid_body_count;
 #endif
     if (!force && model == g_target_cache_model &&
         rigid_body_count == g_target_cache_count) {
@@ -1549,7 +2402,7 @@ std::size_t selected_target_item_count() {
     return count > 0 ? static_cast<std::size_t>(count) : 0;
 }
 
-void update_settings_from_controls();
+void update_settings_from_controls(bool update_target = false);
 
 bool target_selections_equal(
     const physics_control_studio::TargetSelection& left,
@@ -1557,6 +2410,48 @@ bool target_selections_equal(
     return left.kind == right.kind && left.index == right.index &&
         left.collision_group_mask == right.collision_group_mask &&
         left.rigid_body_indices == right.rigid_body_indices;
+}
+
+const physics_control_studio::TargetSelection& target_for_layer(
+    const physics_control_studio::PhysicsSettings& settings,
+    TargetLayer layer) noexcept {
+    switch (layer) {
+    case TargetLayer::Wind: return settings.wind_target;
+    case TargetLayer::Damping: return settings.damping_target;
+    case TargetLayer::Gravity: return settings.gravity_target;
+    }
+    return settings.wind_target;
+}
+
+physics_control_studio::TargetSelection& target_for_layer(
+    physics_control_studio::PhysicsSettings& settings,
+    TargetLayer layer) noexcept {
+    switch (layer) {
+    case TargetLayer::Wind: return settings.wind_target;
+    case TargetLayer::Damping: return settings.damping_target;
+    case TargetLayer::Gravity: return settings.gravity_target;
+    }
+    return settings.wind_target;
+}
+
+const char* target_layer_name(TargetLayer layer) noexcept {
+    switch (layer) {
+    case TargetLayer::Wind: return "wind";
+    case TargetLayer::Damping: return "damping";
+    case TargetLayer::Gravity: return "gravity";
+    }
+    return "wind";
+}
+
+const char* target_kind_name(
+    const physics_control_studio::TargetSelection& target) noexcept {
+    switch (target.kind) {
+    case physics_control_studio::TargetKind::AllDynamic: return "all_dynamic";
+    case physics_control_studio::TargetKind::CollisionGroup: return "collision_group";
+    case physics_control_studio::TargetKind::RigidBody: return "rigid_body";
+    case physics_control_studio::TargetKind::CustomSet: return "custom_set";
+    }
+    return "custom_set";
 }
 
 void populate_target_group_combo(int selected_index = -1) {
@@ -1650,7 +2545,7 @@ bool apply_target_group() {
     g_syncing_controls = true;
     sync_target_list(target);
     g_syncing_controls = false;
-    update_settings_from_controls();
+    update_settings_from_controls(true);
     sync_target_group_name_from_combo();
     g_track_status = L"目标分组已应用";
     return true;
@@ -1738,8 +2633,9 @@ void sync_page_visibility() {
     const bool wind_page = g_panel_page == PanelPage::Wind;
     const bool physics_page = g_panel_page == PanelPage::Physics;
     const bool target_page = g_panel_page == PanelPage::Target;
-    const std::array<HWND, 14> wind_controls{{
+    const std::array<HWND, 17> wind_controls{{
         g_wind_enabled,
+        g_source_mode_combo,
         g_wind_preset_combo,
         g_field_type_combo,
         g_noise_type_combo,
@@ -1752,11 +2648,12 @@ void sync_page_visibility() {
         g_direction_y,
         g_direction_z,
         g_center_x,
-        g_center_y}};
+        g_center_y,
+        g_center_z,
+        g_falloff_type_combo}};
     for (const HWND control : wind_controls) {
         set_control_visible(control, wind_page);
     }
-    set_control_visible(g_center_z, wind_page);
     const std::array<HWND, 8> physics_controls{{
         g_damping_enabled,
         g_linear_damping_slider,
@@ -1769,7 +2666,8 @@ void sync_page_visibility() {
     for (const HWND control : physics_controls) {
         set_control_visible(control, physics_page);
     }
-    const std::array<HWND, 9> target_controls{{
+    const std::array<HWND, 10> target_controls{{
+        g_target_layer_combo,
         g_target_list,
         g_select_all,
         g_clear_selection,
@@ -1782,6 +2680,8 @@ void sync_page_visibility() {
     for (const HWND control : target_controls) {
         set_control_visible(control, target_page);
     }
+    set_control_visible(g_radius_slider, false);
+    set_control_visible(g_core_ratio_slider, false);
     set_control_visible(g_group_combo, false);
 }
 
@@ -1798,10 +2698,15 @@ void sync_controls(bool evaluate_track = true) {
     const auto& physics = controls.physics;
     g_syncing_controls = true;
     set_button_check(g_wind_enabled, g_wind_master_enabled.load());
+    const WindSourceMode source_mode = g_wind_source_mode.load();
+    set_combo_selection(g_source_mode_combo, static_cast<int>(source_mode));
     set_combo_selection(g_wind_preset_combo, g_wind_preset_selection);
     set_combo_selection(g_field_type_combo, static_cast<int>(settings.field_type));
     set_combo_selection(g_noise_type_combo, static_cast<int>(settings.noise_type));
-    set_slider_position(g_strength_slider, static_cast<int>(settings.strength));
+    set_combo_selection(g_falloff_type_combo, static_cast<int>(settings.falloff_type));
+    set_slider_position(
+        g_strength_slider,
+        static_cast<int>(displayed_wind_strength(settings)));
     set_slider_position(g_gust_slider, static_cast<int>(settings.gust * 100.0f));
     set_slider_position(
         g_turbulence_slider, static_cast<int>(settings.turbulence * 100.0f));
@@ -1813,6 +2718,9 @@ void sync_controls(bool evaluate_track = true) {
     set_float_text(g_center_x, settings.center.x);
     set_float_text(g_center_y, settings.center.y);
     set_float_text(g_center_z, settings.center.z);
+    set_slider_position(g_radius_slider, static_cast<int>(settings.radius));
+    set_slider_position(
+        g_core_ratio_slider, static_cast<int>(settings.core_ratio * 100.0f));
     set_button_check(g_damping_enabled, physics.damping_enabled);
     set_slider_position(
         g_linear_damping_slider, static_cast<int>(physics.linear_damping * 100.0f));
@@ -1825,17 +2733,20 @@ void sync_controls(bool evaluate_track = true) {
     set_slider_position(
         g_gravity_acceleration_slider,
         static_cast<int>(physics.gravity_acceleration * 10.0f));
-    set_combo_selection(g_group_combo, target_combo_selection(physics.target));
-    if (!target_selections_equal(target_from_list_selection(), physics.target))
-        sync_target_list(physics.target);
+    set_combo_selection(g_target_layer_combo, static_cast<int>(g_target_layer));
+    const auto& active_target = target_for_layer(physics, g_target_layer);
+    set_combo_selection(g_group_combo, target_combo_selection(active_target));
+    if (!target_selections_equal(target_from_list_selection(), active_target))
+        sync_target_list(active_target);
     const bool radial = settings.field_type == physics_control_studio::WindFieldType::RadialOut ||
         settings.field_type == physics_control_studio::WindFieldType::RadialIn;
-    const bool uses_direction = !radial;
-    const bool uses_center = radial ||
+    const bool controller = source_mode == WindSourceMode::PmxLocal;
+    const bool uses_direction = !radial && !controller;
+    const bool uses_center = !controller && (radial ||
         settings.field_type == physics_control_studio::WindFieldType::Vortex ||
         settings.field_type == physics_control_studio::WindFieldType::Updraft ||
         settings.field_type == physics_control_studio::WindFieldType::Downburst ||
-        settings.field_type == physics_control_studio::WindFieldType::Shear;
+        settings.field_type == physics_control_studio::WindFieldType::Shear);
     set_control_enabled(g_direction_preset_combo, uses_direction);
     set_control_enabled(g_direction_x, uses_direction);
     set_control_enabled(g_direction_y, uses_direction);
@@ -1843,6 +2754,9 @@ void sync_controls(bool evaluate_track = true) {
     set_control_enabled(g_center_x, uses_center);
     set_control_enabled(g_center_y, uses_center);
     set_control_enabled(g_center_z, uses_center);
+    set_control_enabled(g_radius_slider, false);
+    set_control_enabled(g_core_ratio_slider, false);
+    set_control_enabled(g_falloff_type_combo, controller);
     set_control_enabled(g_linear_damping_slider, physics.damping_enabled);
     set_control_enabled(g_angular_damping_slider, physics.damping_enabled);
     set_control_enabled(g_gravity_x, physics.gravity_enabled);
@@ -1851,10 +2765,12 @@ void sync_controls(bool evaluate_track = true) {
     set_control_enabled(g_gravity_acceleration_slider, physics.gravity_enabled);
     sync_page_visibility();
     g_last_synced_frame = g_current_frame.load();
+    g_last_controller_ui_status = g_controller_status.load();
+    g_last_controller_ui_count = static_cast<int>(g_controller_count.load());
     g_syncing_controls = false;
 }
 
-void update_settings_from_controls() {
+void update_settings_from_controls(bool update_target) {
     if (g_syncing_controls) return;
     ExclusiveLock lock(g_wind_lock);
     auto wind = g_wind_settings;
@@ -1883,12 +2799,28 @@ void update_settings_from_controls() {
         wind.noise_type = static_cast<physics_control_studio::WindNoiseType>(
             noise_selection);
     }
-    physics.target = g_target_list != nullptr
-        ? target_from_list_selection()
-        : target_from_combo_selection(ComboBox_GetCurSel(g_group_combo));
+    const int falloff_selection = ComboBox_GetCurSel(g_falloff_type_combo);
+    if (falloff_selection >= 0 && falloff_selection <= 3) {
+        wind.falloff_type = static_cast<physics_control_studio::WindFalloffType>(
+            falloff_selection);
+    }
+    WindSourceMode source_mode = g_wind_source_mode.load();
+    const int source_selection = ComboBox_GetCurSel(g_source_mode_combo);
+    if (source_selection >= static_cast<int>(WindSourceMode::Global) &&
+        source_selection <= static_cast<int>(WindSourceMode::PmxLocal)) {
+        source_mode = static_cast<WindSourceMode>(source_selection);
+    }
+    apply_wind_source_mode(wind, source_mode);
+    physics_control_studio::normalize_wind_settings(wind);
+    if (update_target) {
+        auto selected_target = g_target_list != nullptr
+            ? target_from_list_selection()
+            : target_from_combo_selection(ComboBox_GetCurSel(g_group_combo));
+        target_for_layer(physics, g_target_layer) = selected_target;
+    }
     wind.collision_group_mask =
-        physics.target.kind == physics_control_studio::TargetKind::CollisionGroup
-        ? static_cast<std::uint16_t>(1u << physics.target.index)
+        physics.wind_target.kind == physics_control_studio::TargetKind::CollisionGroup
+        ? static_cast<std::uint16_t>(1u << physics.wind_target.index)
         : 0xffff;
 
     float value = 0.0f;
@@ -1906,8 +2838,11 @@ void update_settings_from_controls() {
         physics_control_studio::validate_physics_settings(physics)) {
         const bool enabled_changed = wind.enabled != g_wind_settings.enabled ||
             physics.gravity_enabled != g_physics_settings.gravity_enabled;
+        const bool source_changed = source_mode != g_wind_source_mode.load();
         g_wind_settings = wind;
         g_physics_settings = physics;
+        g_wind_source_mode.store(source_mode);
+        if (source_changed) reset_wind_source_runtime(source_mode);
         if (enabled_changed) g_last_wind_qpc.store(0);
     }
 }
@@ -1937,7 +2872,8 @@ void layout_panel(HWND window) {
     move(g_wind_page, 20, 64, page_width, 28);
     move(g_physics_page, 28 + page_width, 64, page_width, 28);
     move(g_target_page, 36 + page_width * 2, 64, page_width, 28);
-    move(g_wind_enabled, 20, 100, 180, 28);
+    move(g_wind_enabled, 20, 100, 112, 28);
+    move(g_source_mode_combo, 188, 100, std::max(120, width - 212), 160);
     move(g_wind_preset_combo, field_x, 136, field_width, 200);
     move(g_field_type_combo, field_x, 172, field_width, 220);
     move(g_noise_type_combo, field_x, 208, field_width, 200);
@@ -1952,6 +2888,9 @@ void layout_panel(HWND window) {
     move(g_center_x, field_x, 460, triple_width, 25);
     move(g_center_y, field_x + triple_width + 6, 460, triple_width, 25);
     move(g_center_z, field_x + (triple_width + 6) * 2, 460, triple_width, 25);
+    move(g_radius_slider, -1000, -1000, 10, 10);
+    move(g_core_ratio_slider, -1000, -1000, 10, 10);
+    move(g_falloff_type_combo, field_x, 496, field_width, 160);
 
     move(g_damping_enabled, 20, 100, 190, 28);
     move(g_linear_damping_slider, field_x, 136, std::max(80, field_width - 58), 28);
@@ -1968,7 +2907,8 @@ void layout_panel(HWND window) {
         28);
 
     move(g_group_combo, -1000, -1000, 10, 10);
-    move(g_target_list, 20, 128, std::max(120, width - 40), 212);
+    move(g_target_layer_combo, 112, 100, std::max(120, width - 136), 120);
+    move(g_target_list, 20, 158, std::max(120, width - 40), 182);
     const int target_button_width = std::max(80, (width - 56) / 3);
     move(g_select_all, 20, 350, target_button_width, 28);
     move(g_clear_selection, 28 + target_button_width, 350, target_button_width, 28);
@@ -1979,7 +2919,7 @@ void layout_panel(HWND window) {
     move(g_apply_target_group, 28 + target_button_width, 458, target_button_width, 28);
     move(g_delete_target_group, 36 + target_button_width * 2, 458, target_button_width, 28);
 
-    const int action_y = 494;
+    const int action_y = 610;
     move(g_set_key, 20, action_y, action_width, 30);
     move(g_delete_key, 28 + action_width, action_y, action_width, 30);
     move(g_save_json, 36 + action_width * 2, action_y, action_width, 30);
@@ -2031,7 +2971,7 @@ void destroy_panel_resources() {
 RECT timeline_rect(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
-    return RECT{20, 538, client.right - 20, client.bottom - kPanelFooterHeight - 8};
+    return RECT{20, 654, client.right - 20, client.bottom - kPanelFooterHeight - 8};
 }
 
 std::pair<std::uint32_t, std::uint32_t> timeline_range() {
@@ -2193,7 +3133,7 @@ void paint_panel(HWND window) {
     DrawTextW(
         dc,
         g_panel_page == PanelPage::Wind
-            ? L"专业风场"
+            ? L"风力系统"
             : g_panel_page == PanelPage::Physics ? L"刚体物理" : L"批量目标",
         -1,
         &subtitle,
@@ -2206,8 +3146,10 @@ void paint_panel(HWND window) {
     const auto& physics = controls.physics;
     const bool any_enabled = wind_effect_active(settings) || physics.damping_enabled ||
         physics.gravity_enabled;
-    const bool backend_ok = g_wind_backend_status.load() >= 0;
-    const COLORREF status_color = !bridge_online || !backend_ok
+    const int backend_status = g_wind_backend_status.load();
+    const bool backend_ok = backend_status >= 0;
+    const bool waiting_for_pmx = backend_status == 3;
+    const COLORREF status_color = !bridge_online || !backend_ok || waiting_for_pmx
         ? kWarningColor
         : any_enabled ? kAccentColor : kMutedTextColor;
     HBRUSH status_brush = CreateSolidBrush(
@@ -2222,7 +3164,9 @@ void paint_panel(HWND window) {
     RECT live{client.right - 89, 12, client.right - 49, 38};
     DrawTextW(
         dc,
-        !bridge_online ? L"等待" : any_enabled ? L"启用" : L"关闭",
+        !bridge_online || waiting_for_pmx
+            ? L"等待"
+            : any_enabled ? L"启用" : L"关闭",
         -1,
         &live,
         DT_SINGLELINE | DT_CENTER | DT_VCENTER);
@@ -2249,8 +3193,15 @@ void paint_panel(HWND window) {
         DrawTextW(dc, text, -1, &label, DT_SINGLELINE | DT_VCENTER);
     };
     if (g_panel_page == PanelPage::Wind) {
+        RECT source_label{140, 99, 184, 127};
+        DrawTextW(
+            dc,
+            L"风源",
+            -1,
+            &source_label,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER);
         draw_label(L"环境预设", 135);
-        draw_label(L"风场类型", 171);
+        draw_label(L"风力类型", 171);
         draw_label(L"噪波类型", 207);
         draw_label(L"风力强度", 243);
         draw_label(L"阵风幅度", 279);
@@ -2259,13 +3210,15 @@ void paint_panel(HWND window) {
         draw_label(L"方向预设", 387);
         draw_label(L"方向 X Y Z", 423);
         draw_label(L"中心 X Y Z", 459);
+        draw_label(L"距离衰减", 495);
     } else if (g_panel_page == PanelPage::Physics) {
         draw_label(L"线性阻尼", 135);
         draw_label(L"角阻尼", 171);
         draw_label(L"重力 X Y Z", 243);
         draw_label(L"重力强度", 279);
     } else {
-        RECT target_hint{20, 98, client.right - 20, 124};
+        draw_label(L"作用层", 99);
+        RECT target_hint{20, 130, client.right - 20, 154};
         DrawTextW(
             dc,
             L"直接点击复选；Shift 连选，Ctrl+Shift 追加",
@@ -2276,14 +3229,14 @@ void paint_panel(HWND window) {
         draw_label(L"分组名称", 423);
     }
 
-    wchar_t value_text[64]{};
+    wchar_t value_text[128]{};
     SetTextColor(dc, kTextColor);
     if (g_panel_page == PanelPage::Wind) {
         std::swprintf(
             value_text,
             std::size(value_text),
             L"%.0f",
-            static_cast<double>(settings.strength));
+            static_cast<double>(displayed_wind_strength(settings)));
         RECT strength_value{client.right - 62, 235, client.right - 24, 255};
         DrawTextW(dc, value_text, -1, &strength_value, DT_SINGLELINE | DT_RIGHT);
         std::swprintf(
@@ -2352,14 +3305,30 @@ void paint_panel(HWND window) {
         client.bottom - kPanelFooterHeight,
         client.right - kPanelPadding,
         client.bottom};
+    const int controller_status = g_controller_status.load();
+    wchar_t source_text_buffer[32]{};
+    const wchar_t* source_text = L"全局风场";
+    if (g_wind_source_mode.load() == WindSourceMode::PmxLocal) {
+        if (controller_status == 2) {
+            std::swprintf(
+                source_text_buffer,
+                std::size(source_text_buffer),
+                L"PMX已连接 %u",
+                static_cast<unsigned>(g_controller_count.load()));
+            source_text = source_text_buffer;
+        } else {
+            source_text = controller_status == 1 ? L"PMX未发现" : L"PMX局部";
+        }
+    }
     std::swprintf(
         value_text,
         std::size(value_text),
-        L"F%u  |  %zu 键  |  %zu 项目标  |  %ls",
+        L"F%u  |  %zu 键  |  %zu 项目标  |  %ls  |  %ls",
         static_cast<unsigned>(g_current_frame.load()),
         control_key_count(),
         selected_target_item_count(),
-        g_track_status.c_str());
+        g_track_status.c_str(),
+        source_text);
     DrawTextW(dc, value_text, -1, &footer, DT_SINGLELINE | DT_VCENTER);
     if (dc != paint_dc) {
         BitBlt(
@@ -2392,7 +3361,7 @@ void paint_owner_button(const DRAWITEMSTRUCT& item) {
         item.CtlID == kGravityEnabledId) {
         const auto controls = control_snapshot();
         const bool checked = item.CtlID == kWindEnabledId
-            ? controls.wind.enabled
+            ? g_wind_master_enabled.load()
             : item.CtlID == kDampingEnabledId
                 ? controls.physics.damping_enabled
                 : controls.physics.gravity_enabled;
@@ -2567,13 +3536,20 @@ LRESULT CALLBACK panel_window_proc(
             sizeof(rounded_corner));
         SetLayeredWindowAttributes(window, 0, 248, LWA_ALPHA);
         g_wind_page = create_panel_control(
-            window, 0, L"BUTTON", L"风场", BS_OWNERDRAW, kWindPageId);
+            window, 0, L"BUTTON", L"风力系统", BS_OWNERDRAW, kWindPageId);
         g_physics_page = create_panel_control(
             window, 0, L"BUTTON", L"刚体", BS_OWNERDRAW, kPhysicsPageId);
         g_target_page = create_panel_control(
             window, 0, L"BUTTON", L"目标", BS_OWNERDRAW, kTargetPageId);
         g_wind_enabled = create_panel_control(
-            window, 0, L"BUTTON", L"启用风场", BS_OWNERDRAW, kWindEnabledId);
+            window, 0, L"BUTTON", L"启用风力", BS_OWNERDRAW, kWindEnabledId);
+        g_source_mode_combo = create_panel_control(
+            window,
+            0,
+            L"COMBOBOX",
+            L"",
+            CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+            kSourceModeComboId);
         g_wind_preset_combo = create_panel_control(
             window,
             0,
@@ -2627,6 +3603,22 @@ LRESULT CALLBACK panel_window_proc(
             window, WS_EX_CLIENTEDGE, L"EDIT", L"", ES_CENTER | ES_AUTOHSCROLL, kCenterYId);
         g_center_z = create_panel_control(
             window, WS_EX_CLIENTEDGE, L"EDIT", L"", ES_CENTER | ES_AUTOHSCROLL, kCenterZId);
+        g_radius_slider = create_panel_control(
+            window, 0, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS, kRadiusSliderId);
+        g_core_ratio_slider = create_panel_control(
+            window,
+            0,
+            TRACKBAR_CLASSW,
+            L"",
+            TBS_HORZ | TBS_NOTICKS,
+            kCoreRatioSliderId);
+        g_falloff_type_combo = create_panel_control(
+            window,
+            0,
+            L"COMBOBOX",
+            L"",
+            CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+            kFalloffTypeComboId);
         g_group_combo = create_panel_control(
             window,
             0,
@@ -2634,6 +3626,13 @@ LRESULT CALLBACK panel_window_proc(
             L"",
             CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
             kGroupComboId);
+        g_target_layer_combo = create_panel_control(
+            window,
+            0,
+            L"COMBOBOX",
+            L"",
+            CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+            kTargetLayerComboId);
         g_target_list = create_panel_control(
             window,
             WS_EX_CLIENTEDGE,
@@ -2710,6 +3709,7 @@ LRESULT CALLBACK panel_window_proc(
             window, 0, L"BUTTON", L"读取 JSON", BS_OWNERDRAW, kLoadJsonId);
         if (g_wind_page == nullptr || g_physics_page == nullptr ||
             g_target_page == nullptr || g_wind_enabled == nullptr ||
+            g_source_mode_combo == nullptr ||
             g_wind_preset_combo == nullptr || g_field_type_combo == nullptr ||
             g_noise_type_combo == nullptr ||
             g_strength_slider == nullptr || g_gust_slider == nullptr ||
@@ -2718,7 +3718,10 @@ LRESULT CALLBACK panel_window_proc(
             g_direction_x == nullptr ||
             g_direction_y == nullptr || g_direction_z == nullptr ||
             g_center_x == nullptr || g_center_y == nullptr || g_center_z == nullptr ||
-            g_group_combo == nullptr || g_target_list == nullptr ||
+            g_radius_slider == nullptr || g_core_ratio_slider == nullptr ||
+            g_falloff_type_combo == nullptr ||
+            g_group_combo == nullptr || g_target_layer_combo == nullptr ||
+            g_target_list == nullptr ||
             g_select_all == nullptr || g_clear_selection == nullptr ||
             g_invert_selection == nullptr || g_target_group_combo == nullptr ||
             g_target_group_name == nullptr || g_save_target_group == nullptr ||
@@ -2734,10 +3737,16 @@ LRESULT CALLBACK panel_window_proc(
         }
         SetWindowSubclass(
             g_target_list, target_list_subclass_proc, kTargetListSubclassId, 0);
-        SendMessageW(g_strength_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 300));
+        SendMessageW(
+            g_strength_slider,
+            TBM_SETRANGE,
+            TRUE,
+            MAKELPARAM(0, kMaximumPanelWindStrength));
         SendMessageW(g_gust_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_turbulence_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_frequency_slider, TBM_SETRANGE, TRUE, MAKELPARAM(5, 400));
+        SendMessageW(g_radius_slider, TBM_SETRANGE, TRUE, MAKELPARAM(1, 200));
+        SendMessageW(g_core_ratio_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_linear_damping_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_angular_damping_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(
@@ -2745,6 +3754,8 @@ LRESULT CALLBACK panel_window_proc(
             TBM_SETRANGE,
             TRUE,
             MAKELPARAM(0, 300));
+        ComboBox_AddString(g_source_mode_combo, L"全局风场");
+        ComboBox_AddString(g_source_mode_combo, L"PMX 局部");
         ComboBox_AddString(g_wind_preset_combo, L"自定义");
         ComboBox_AddString(g_wind_preset_combo, L"微风");
         ComboBox_AddString(g_wind_preset_combo, L"轻风");
@@ -2752,6 +3763,7 @@ LRESULT CALLBACK panel_window_proc(
         ComboBox_AddString(g_wind_preset_combo, L"强风");
         ComboBox_AddString(g_wind_preset_combo, L"烈风");
         ComboBox_AddString(g_wind_preset_combo, L"飓风");
+        ComboBox_AddString(g_wind_preset_combo, L"狂暴风");
         ComboBox_AddString(g_field_type_combo, L"定向风");
         ComboBox_AddString(g_field_type_combo, L"空间湍流");
         ComboBox_AddString(g_field_type_combo, L"涡旋风");
@@ -2765,6 +3777,10 @@ LRESULT CALLBACK panel_window_proc(
         ComboBox_AddString(g_noise_type_combo, L"分形湍流");
         ComboBox_AddString(g_noise_type_combo, L"脉冲阵风");
         ComboBox_AddString(g_noise_type_combo, L"随机阵风");
+        ComboBox_AddString(g_falloff_type_combo, L"硬边界");
+        ComboBox_AddString(g_falloff_type_combo, L"线性衰减");
+        ComboBox_AddString(g_falloff_type_combo, L"平滑衰减");
+        ComboBox_AddString(g_falloff_type_combo, L"平方衰减");
         ComboBox_AddString(g_direction_preset_combo, L"自定义");
         ComboBox_AddString(g_direction_preset_combo, L"+X");
         ComboBox_AddString(g_direction_preset_combo, L"-X");
@@ -2772,12 +3788,17 @@ LRESULT CALLBACK panel_window_proc(
         ComboBox_AddString(g_direction_preset_combo, L"-Y");
         ComboBox_AddString(g_direction_preset_combo, L"+Z");
         ComboBox_AddString(g_direction_preset_combo, L"-Z");
+        ComboBox_AddString(g_target_layer_combo, L"风力层");
+        ComboBox_AddString(g_target_layer_combo, L"阻尼层");
+        ComboBox_AddString(g_target_layer_combo, L"重力层");
+        ComboBox_SetCurSel(g_target_layer_combo, static_cast<int>(g_target_layer));
         populate_target_combo(true);
-        const std::array<HWND, 40> controls{{
+        const std::array<HWND, 45> controls{{
             g_wind_page,
             g_physics_page,
             g_target_page,
             g_wind_enabled,
+            g_source_mode_combo,
             g_wind_preset_combo,
             g_field_type_combo,
             g_noise_type_combo,
@@ -2792,7 +3813,11 @@ LRESULT CALLBACK panel_window_proc(
             g_center_x,
             g_center_y,
             g_center_z,
+            g_radius_slider,
+            g_core_ratio_slider,
+            g_falloff_type_combo,
             g_group_combo,
+            g_target_layer_combo,
             g_target_list,
             g_select_all,
             g_clear_selection,
@@ -2816,11 +3841,14 @@ LRESULT CALLBACK panel_window_proc(
             g_load_json,
         }};
         for (const HWND control : controls) set_control_font(control, g_panel_font);
+        SetWindowTheme(g_source_mode_combo, L"", nullptr);
         SetWindowTheme(g_field_type_combo, L"", nullptr);
         SetWindowTheme(g_wind_preset_combo, L"", nullptr);
         SetWindowTheme(g_noise_type_combo, L"", nullptr);
+        SetWindowTheme(g_falloff_type_combo, L"", nullptr);
         SetWindowTheme(g_direction_preset_combo, L"", nullptr);
         SetWindowTheme(g_group_combo, L"", nullptr);
+        SetWindowTheme(g_target_layer_combo, L"", nullptr);
         SetWindowTheme(g_target_list, L"", nullptr);
         SetWindowTheme(g_target_group_combo, L"", nullptr);
         SendMessageW(g_group_combo, CB_SETDROPPEDWIDTH, 360, 0);
@@ -2869,6 +3897,14 @@ LRESULT CALLBACK panel_window_proc(
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
+        if (id == kSourceModeComboId && notification == CBN_SELCHANGE &&
+            !g_syncing_controls) {
+            update_settings_from_controls(false);
+            g_last_wind_qpc.store(0);
+            sync_controls(false);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
         if (id == kWindPresetComboId && notification == CBN_SELCHANGE &&
             !g_syncing_controls) {
             const int selection = ComboBox_GetCurSel(g_wind_preset_combo);
@@ -2878,10 +3914,22 @@ LRESULT CALLBACK panel_window_proc(
             return 0;
         }
         if ((id == kGroupComboId || id == kFieldTypeComboId ||
-             id == kNoiseTypeComboId) &&
+             id == kNoiseTypeComboId || id == kFalloffTypeComboId) &&
             notification == CBN_SELCHANGE) {
-            if (id == kNoiseTypeComboId) g_wind_preset_selection = 0;
-            update_settings_from_controls();
+            if (id == kNoiseTypeComboId || id == kFalloffTypeComboId)
+                g_wind_preset_selection = 0;
+            update_settings_from_controls(id == kGroupComboId);
+            sync_controls(false);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        if (id == kTargetLayerComboId && notification == CBN_SELCHANGE &&
+            !g_syncing_controls) {
+            update_settings_from_controls(true);
+            const int selection = ComboBox_GetCurSel(g_target_layer_combo);
+            if (selection >= 0 && selection <= 2) {
+                g_target_layer = static_cast<TargetLayer>(selection);
+            }
             sync_controls(false);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
@@ -2896,7 +3944,7 @@ LRESULT CALLBACK panel_window_proc(
             } else {
                 ListBox_SetSel(g_target_list, FALSE, 0);
             }
-            update_settings_from_controls();
+            update_settings_from_controls(true);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
@@ -2935,7 +3983,7 @@ LRESULT CALLBACK panel_window_proc(
                 }
             }
             g_syncing_controls = false;
-            update_settings_from_controls();
+            update_settings_from_controls(true);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
@@ -2954,7 +4002,7 @@ LRESULT CALLBACK panel_window_proc(
              id == kCenterXId || id == kCenterYId || id == kCenterZId ||
              id == kGravityXId || id == kGravityYId || id == kGravityZId) &&
             notification == EN_CHANGE && !g_syncing_controls) {
-            update_settings_from_controls();
+            update_settings_from_controls(false);
             if (id == kDirectionXId || id == kDirectionYId || id == kDirectionZId) {
                 ComboBox_SetCurSel(g_direction_preset_combo, 0);
             }
@@ -2969,7 +4017,7 @@ LRESULT CALLBACK panel_window_proc(
             return 0;
         }
         if ((id == kSetKeyId || id == kDeleteKeyId) && notification == BN_CLICKED) {
-            update_settings_from_controls();
+            update_settings_from_controls(false);
             {
                 ExclusiveLock lock(g_wind_lock);
                 if (id == kSetKeyId) {
@@ -2993,7 +4041,7 @@ LRESULT CALLBACK panel_window_proc(
         }
         if ((id == kSaveJsonId || id == kLoadJsonId) && notification == BN_CLICKED) {
             if (id == kSaveJsonId) {
-                update_settings_from_controls();
+                update_settings_from_controls(false);
                 save_track_file();
             } else {
                 load_track_file();
@@ -3013,6 +4061,9 @@ LRESULT CALLBACK panel_window_proc(
              measure->CtlID == kDirectionPresetComboId ||
              measure->CtlID == kWindPresetComboId ||
              measure->CtlID == kNoiseTypeComboId ||
+             measure->CtlID == kSourceModeComboId ||
+             measure->CtlID == kFalloffTypeComboId ||
+             measure->CtlID == kTargetLayerComboId ||
              measure->CtlID == kTargetGroupComboId ||
              measure->CtlID == kTargetListId)) {
             measure->itemHeight = measure->CtlID == kTargetListId ? 27 : 25;
@@ -3038,6 +4089,9 @@ LRESULT CALLBACK panel_window_proc(
         if (item->CtlID == kGroupComboId || item->CtlID == kFieldTypeComboId ||
             item->CtlID == kDirectionPresetComboId ||
             item->CtlID == kWindPresetComboId || item->CtlID == kNoiseTypeComboId ||
+            item->CtlID == kSourceModeComboId ||
+            item->CtlID == kFalloffTypeComboId ||
+            item->CtlID == kTargetLayerComboId ||
             item->CtlID == kTargetGroupComboId) {
             paint_group_item(*item);
             return TRUE;
@@ -3063,7 +4117,11 @@ LRESULT CALLBACK panel_window_proc(
                 g_wind_preset_selection = 0;
                 ComboBox_SetCurSel(g_wind_preset_combo, 0);
             }
-            update_settings_from_controls();
+            if (reinterpret_cast<HWND>(lparam) == g_strength_slider) {
+                g_wind_master_strength.store(static_cast<float>(
+                    SendMessageW(g_strength_slider, TBM_GETPOS, 0, 0)));
+            }
+            update_settings_from_controls(false);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
@@ -3072,7 +4130,11 @@ LRESULT CALLBACK panel_window_proc(
         if (wparam == kRefreshTimerId && IsWindowVisible(window)) {
             const bool targets_changed = populate_target_combo();
             const std::uint32_t frame = g_current_frame.load();
-            if (targets_changed || g_last_synced_frame != frame) {
+            const int controller_status = g_controller_status.load();
+            const int controller_count = static_cast<int>(g_controller_count.load());
+            if (targets_changed || g_last_synced_frame != frame ||
+                g_last_controller_ui_status != controller_status ||
+                g_last_controller_ui_count != controller_count) {
                 sync_controls();
                 RECT client{};
                 GetClientRect(window, &client);
@@ -3164,6 +4226,7 @@ LRESULT CALLBACK panel_window_proc(
         g_physics_page = nullptr;
         g_target_page = nullptr;
         g_wind_enabled = nullptr;
+        g_source_mode_combo = nullptr;
         g_wind_preset_combo = nullptr;
         g_field_type_combo = nullptr;
         g_noise_type_combo = nullptr;
@@ -3178,7 +4241,11 @@ LRESULT CALLBACK panel_window_proc(
         g_center_x = nullptr;
         g_center_y = nullptr;
         g_center_z = nullptr;
+        g_radius_slider = nullptr;
+        g_core_ratio_slider = nullptr;
+        g_falloff_type_combo = nullptr;
         g_group_combo = nullptr;
+        g_target_layer_combo = nullptr;
         g_target_list = nullptr;
         g_select_all = nullptr;
         g_clear_selection = nullptr;
@@ -3205,6 +4272,8 @@ LRESULT CALLBACK panel_window_proc(
         g_target_cache_model = 0;
         g_target_cache_count = UINT32_MAX;
         g_last_synced_frame = UINT32_MAX;
+        g_last_controller_ui_status = -1;
+        g_last_controller_ui_count = -1;
         destroy_panel_resources();
         break;
     default:
@@ -3376,6 +4445,7 @@ bool install_on_ui_thread(HWND host) {
 
 bool uninstall_on_ui_thread(HWND host) {
     if (!g_installed.load()) return true;
+    const bool damping_restored = restore_tracked_damping_overrides();
     const HWND panel = g_panel.load();
     if (panel != nullptr && IsWindow(panel)) DestroyWindow(panel);
     if (host != nullptr && IsWindow(host)) {
@@ -3386,7 +4456,7 @@ bool uninstall_on_ui_thread(HWND host) {
     g_installed.store(false);
     reset_frame_bridge();
     g_snapshot_text.clear();
-    return true;
+    return damping_restored;
 }
 
 LRESULT CALLBACK request_hook(int code, WPARAM wparam, LPARAM lparam) {
@@ -3494,26 +4564,32 @@ std::wstring status_json() {
     const auto controls = control_snapshot();
     const auto& wind = controls.wind;
     const auto& physics = controls.physics;
-    const char* target_kind = "custom_set";
-    if (physics.target.kind == physics_control_studio::TargetKind::AllDynamic)
-        target_kind = "all_dynamic";
-    else if (physics.target.kind == physics_control_studio::TargetKind::CollisionGroup)
-        target_kind = "collision_group";
-    else if (physics.target.kind == physics_control_studio::TargetKind::RigidBody)
-        target_kind = "rigid_body";
-    char narrow[1024]{};
+    const auto& active_target = target_for_layer(physics, g_target_layer);
+    const WindSourceMode source_mode = g_wind_source_mode.load();
+    const int controller_status = g_controller_status.load();
+    const std::uint32_t controller_count = g_controller_count.load();
+    const char* controller_state = source_mode != WindSourceMode::PmxLocal
+        ? "inactive"
+        : controller_status == 2 ? "connected"
+        : controller_status == 1 ? "missing" : "idle";
+    char narrow[1280]{};
     std::snprintf(
         narrow,
         sizeof(narrow),
         "{\"component\":\"WindTool\",\"api_version\":65537,"
         "\"installed\":%s,\"host_status\":\"%s\","
-        "\"panel_visible\":%s,\"write_backend\":\"bullet_velocity\","
+        "\"panel_visible\":%s,\"write_backend\":\"bullet_force_accumulator\"," 
+        "\"activation_backend\":\"bullet_activate\"," 
         "\"mode\":\"animated_physics_control\",\"wind_enabled\":%s,"
-        "\"wind_strength\":%.2f,"
+        "\"wind_strength\":%.2f,\"wind_source\":\"%s\","
+        "\"controller_status\":\"%s\",\"controller_count\":%u,"
+        "\"controller_limit\":%zu,"
         "\"damping_enabled\":%s,\"linear_damping\":%.3f,"
         "\"angular_damping\":%.3f,\"gravity_enabled\":%s,"
-        "\"gravity_acceleration\":%.3f,\"target_kind\":\"%s\","
-        "\"target_index\":%u,\"current_frame\":%u,\"keyframes\":%zu,"
+        "\"gravity_acceleration\":%.3f,\"target_layer\":\"%s\"," 
+        "\"target_kind\":\"%s\",\"target_index\":%u,"
+        "\"wind_target_index\":%u,\"damping_target_index\":%u,"
+        "\"gravity_target_index\":%u,\"current_frame\":%u,\"keyframes\":%zu,"
         "\"wind_backend\":\"%s\",\"wind_applied_frames\":%llu,"
         "\"wind_applied_bodies\":%llu,\"frame_bridge\":\"%s\","
         "\"ui_thread_id\":%lu,\"frame_thread_id\":%lu,"
@@ -3522,14 +4598,22 @@ std::wstring status_json() {
         status_name(status),
         panel != nullptr && IsWindowVisible(panel) ? "true" : "false",
         wind_effect_active(wind) ? "true" : "false",
-        static_cast<double>(wind.strength),
+        static_cast<double>(displayed_wind_strength(wind)),
+        source_mode == WindSourceMode::PmxLocal ? "pmx_local" : "global",
+        controller_state,
+        static_cast<unsigned>(controller_count),
+        kMaximumWindControllers,
         physics.damping_enabled ? "true" : "false",
         static_cast<double>(physics.linear_damping),
         static_cast<double>(physics.angular_damping),
         physics.gravity_enabled ? "true" : "false",
         static_cast<double>(physics.gravity_acceleration),
-        target_kind,
-        static_cast<unsigned>(physics.target.index),
+        target_layer_name(g_target_layer),
+        target_kind_name(active_target),
+        static_cast<unsigned>(active_target.index),
+        static_cast<unsigned>(physics.wind_target.index),
+        static_cast<unsigned>(physics.damping_target.index),
+        static_cast<unsigned>(physics.gravity_target.index),
         static_cast<unsigned>(g_current_frame.load()),
         control_key_count(),
         wind_backend_status(),

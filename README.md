@@ -1,69 +1,162 @@
 # WindTool
 
-WindTool 是面向 **MikuMikuDance 9.31 x64** 的实时风场与局部刚体物理控制扩展。它在 MMD 内提供中文叠加面板、可视化目标多选、命名分组、阻尼/重力覆盖，以及独立 JSON 物理关键帧轨道。
+WindTool 是面向 MikuMikuDance 9.31 x64 的实时风力与物理控制扩展。主界面已经全面中文化，提供风力系统、刚体和目标三个页面，并在底部显示可视化关键帧轨道。内部 DLL 与 JSON 路径继续保留原名，以兼容已有安装和轨道文件。
 
-## 兼容性
+## 项目信息
 
-当前公开版本只支持：
+- 作者：克里斯提亚娜
+- 开源协议：MIT License
 
-| 项目 | 要求 |
-| --- | --- |
-| MMD | MikuMikuDance 9.31 x64 |
-| `MikuMikudance.exe` SHA-256 | `2C9414C21619B4AD85D9C2EF76836F3C34DB7A8ABD07BD6C6176D385F7EFDFB4` |
-| 原始 `MMEffect.dll` SHA-256 | `A20D77FB6C6919B7894EEADCFB852F5EA6D56E93C5A65142BC2DAE75C6F54D25` |
-| 系统 | Windows x64 |
+## 当前能力
 
-散列不匹配时，安装脚本会拒绝修改文件。不要通过删除校验来强行安装；不同构建的结构偏移可能不同。
+- 风源只保留两种互斥模式：全局风场与 PMX 局部。
+- 关闭总开关或将风力强度降到 `0` 时，即使当前帧存在非零风力关键帧也会立即停止写入风力；插件不会清零刚体速度，后续完全交还 MMD 原生 Bullet 求解器。
+- 八种实时力场：定向风、空间湍流、涡旋、径向外推、径向吸入、热上升气流、下击暴流和风切变。
+- 八档环境预设：自定义、微风、轻风、稳定风、强风、烈风、飓风和狂暴风。
+- 五种噪波：平滑阵风、柏林噪波、分形湍流、脉冲阵风和随机阵风。
+- `自定义 / ±X / ±Y / ±Z` 方向预设，XYZ 输入键入时立即生效。
+- 风向三轴输入与自动归一化。
+- 风力强度、阵风幅度、噪波强度和变化频率独立控制；面板基础强度为线性 `0 - 1000`，`0` 会立即停止风力写入。
+- 旋涡与径向力场的中心坐标控制。
+- PMX 局部模式可加载 `WindTool-WindSource.pmx` 作为视口风源：球形笼就是实际作用半径，第一根骨骼的位置决定中心，本地 `+X` 决定风向，`風場範囲 / 風力倍率 / 減衰核心` 三个表情实时控制半径、强度倍率和核心比例。名称使用 MMD 9.31 的 CP932 兼容字形，内部英文标识仍为 `WT_*`。
+- PMX 局部模式最多同时读取 `16` 个风源控制器。每个控制器独立计算范围、方向、倍率与距离衰减；同向风会增强，反向风会按向量自然抵消。
+- PMX 球形笼外严格停止施力，并立即清理该刚体的风力平滑缓存；找不到 PMX 风源时局部风为零，不使用隐藏的面板参数回退。
+- PMX 风源带蓝色三轴半径笼、橙色方向箭头和黄色核心比例刻度；视口可视化和插件读取使用同一组表情权重。
+- 风源模型与受力角色分别解析；选中、移动或旋转风源 PMX 时，风力仍持续作用于最近的有效角色刚体模型。
+- 可视化多选目标列表，可组合多个碰撞组与多个具名动态刚体。
+- 支持全部、清空、反选、直接点击复选，以及 `Shift` 连续范围选择；`Ctrl+Shift` 可追加范围。
+- 可将当前刚体选择保存为命名分组，并随时应用、覆盖或删除。
+- 风力、阻尼和重力使用三套独立目标层，可以同时让头发受风、裙摆使用局部重力、饰品使用另一套阻尼。
+- 可按目标覆盖线性阻尼与角阻尼。
+- 关闭阻尼覆盖、切换目标、切换模型或卸载插件时，会把已接管刚体恢复为 PMX 记录中的原始线性阻尼与角阻尼。
+- 可按目标覆盖重力方向与重力加速度。
+- 在 MMD 当前时间轴帧设置和删除物理关键帧。
+- 底部序列帧式轨道显示当前播放头、帧刻度和可选中的关键帧菱形。
+- 关键帧轨道自动保存为 JSON，并在打开面板时自动读取。
+- 命名目标分组与关键帧保存在同一 JSON 中；当前格式为版本 `3`，版本 `1/2` 文件会兼容读取并迁移。旧文件中启用了 PMX 控制器的状态会迁移为 PMX 局部，旧的面板局部状态会迁移为全局风场。
+- 风源模式是独立的运行时选择，不参与关键帧插值；旧关键帧中的局部布尔值不能覆盖当前风源模式。
+- 风力、阻尼与重力数值在关键帧之间线性插值；开关、风场类型和目标对象保持阶梯切换。
+- 自动跳过骨骼同步刚体，只影响动态刚体。
+- 风力使用 Bullet 总力累加器，并对每个刚体的最终风加速度做连续低通平滑。多个 PMX 风源先逐一评估，再进行向量求和；两个以上有效来源的组合加速度上限为 `4000`，求和后还会重新应用最大速度限制。
+- 写入前完整读取和可写区间预检；单次写入失败时回滚本帧已写速度、力和阻尼。
+- 精确锁定 MikuMikuDance 9.31 x64 的文件名、大小和 SHA-256。
+- MME begin-scene 帧桥只接受 MMD UI 线程调用。
+- 面板使用双缓冲、子窗口裁剪和按需刷新，暂停时间轴时不会被定时器周期性整窗重绘。
+- 底层宿主与内存安全校验继续运行，但不会生成用户可见的检测面板。
 
-## 构建
+## 实现边界
 
-需要 CMake 3.20+，以及 Visual Studio 2022 x64 工具链或 MinGW-w64。仓库已包含构建所需的版本锁定接口头文件，不依赖仓库外的 SDK。
+当前风场通过已验证的 Bullet 刚体总力累加器实现，位置和速度读取来自刚体当前状态。MMD 的 `runtime_object` 已确认直接指向 `btRigidBody`，使用的版本锁定偏移为：
 
-```powershell
-pwsh -File .\scripts\Build-WindTool.ps1
+```text
+world position                +0x40
+interpolation linear velocity +0x90
+activation state              +0xEC
+deactivation timer            +0xF0
+solver linear velocity        +0x150
+total force accumulator       +0x1D0
+total torque accumulator      +0x1E0
+linear damping                +0x1F0
+angular damping               +0x1F4
 ```
 
-也可以手动构建：
+风力按视口实时渲染节拍持续执行，不依赖时间轴帧号。每次增量使用高精度实时时钟计算，但风场相位使用插件自身的相对时间累加器，避免系统运行时间转成 `float` 后出现噪波阶梯。MMD 9.31 的 Bullet 世界会在每次物理步结束后清空总力累加器，因此关闭风场只需停止新增风力，不能额外清零线速度或角速度。实际改变力或速度的写入会调用 MMD 自带的 `btCollisionObject::activate(bool)`（RVA `0xED330`），同时清零休眠计时器；不会再使用只改状态、不清计时器的 `forceActivationState`（RVA `0xED310`）。暂停时间轴时 MMD 的实时物理仍会受到风力，且不同视口帧率下的总体加速度保持一致。回调线程、宿主哈希、模型表、刚体数量、运行时对象和写入内存范围任一校验失败时，本次不会继续写入。
 
-```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release --parallel
-ctest --test-dir build -C Release --output-on-failure
-cmake --install build --config Release --prefix dist
+PMX 风源读取同样锁定 MMD 9.31 已分析结构：模型骨骼表为 `+0x2748`、骨骼数为 `+0x3110`、骨骼步长为 `0x270`、世界矩阵为骨骼记录 `+0x3C`；模型表情表为 `+0x2758`、表情数为 `+0x310C`，运行时表情记录大小为 `0xC0`、权重为 `+0x38`。插件扫描模型表中同时含有 `WT_Radius`、`WT_Strength`、`WT_Falloff` 的模型，按模型表稳定顺序缓存最多 `16` 个控制器；加载或卸载模型时立即重扫，平时每帧只更新缓存控制器，并每约 `60` 个物理帧轻量重扫一次，以接纳延迟初始化或短暂失效后恢复的风源。显示名可以是 MMD 兼容的本地名称，识别始终使用稳定英文标识。一个控制器失效不会让其他有效风源停止工作；全部缺失时局部风严格为零。
+
+受力模型使用 MMD 9.31 模型记录中的刚体表 `+0x3568` 与刚体数 `+0x3578` 验证。解析顺序为：当前选中的有效刚体模型、上一次有效角色模型、首个已加载的有效刚体模型。因此选择没有角色刚体的风源 PMX 不会把物理目标切走。
+
+重力覆盖通过补偿 MMD 原生重力与目标重力之间的速度差实现，因此不需要替换整个 Bullet 世界。阻尼是 Bullet 刚体上的持久参数，插件只在覆盖开启时接管它，并在所有权结束时按 PMX 刚体记录恢复原值。阻尼和速度写入都会先完成可读写预检，任一步失败会回滚本帧已经执行的修改。
+
+关键帧轨道不修改 PMM 文件，默认保存到：
+
+```text
+MikuMikuDance -2\PhysicsControlStudio\PhysicsControlStudio.json
 ```
 
-MinGW/Ninja 示例：
+设置或删除关键帧时会自动保存，也可以使用面板中的 `保存 JSON / 读取 JSON`。当前版本使用一个全局轨道 JSON，后续可以继续扩展为按 PMM 工程自动切换同名 JSON。质量、Joint 重建和骨骼回写覆盖仍保留在核心命令模型中，但尚未暴露到主面板。
+
+插件不会自行解析或改写 PMM。面板参数继续保存在 JSON；如果在 MMD 中给风源模型的骨骼或表情注册关键帧，它们会像普通模型动画一样由 MMD 自己保存，插件只在每个物理帧读取当前世界矩阵和表情权重。
+
+## 构建与测试
 
 ```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake -S . -B build -G Ninja
+cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
-cmake --install build --prefix dist
 ```
 
-## 安装
+一键构建、测试并生成 `dist` 安装目录：
 
-安装脚本必须显式传入 MMD 目录。它会先验证散列，将原始 `MMEffect.dll` 保存为 `MMEffect.original.dll`，再安装转发器与 WindTool DLL。
+```powershell
+.\scripts\Build-WindTool.ps1
+```
+
+构建过程会运行四项 CTest，并把 DLL、MME 转发器和 PMX 风源安装到 `dist`。
+
+生成带安装脚本、说明文档和 SHA-256 清单的 Release：
+
+```powershell
+.\scripts\Package-WindTool.ps1
+```
+
+## 使用方法
+
+1. 启动受支持 MMD 目录中的 `MikuMikudance.exe`。
+2. 加载带动态刚体的 PMD/PMX 模型。
+3. 如需视口局部风源，再加载 `WindTool\WindTool-WindSource.pmx`。
+4. 打开 `WindTool > 打开 WindTool`。
+5. 在风力系统页启用风力，选择环境预设、风场类型和噪波类型。
+6. 使用方向预设选择 `±X / ±Y / ±Z`，或直接输入自定义 XYZ。
+7. `全局风场` 会对目标刚体直接使用当前风场；如需局部风源，在 `风源` 下拉框选择 `PMX 局部`。
+8. PMX 模式下球形笼就是作用范围，移动/旋转 `风源控制` 骨骼即可在视口定位和转向；选中风源模型不会中断角色受风。
+9. PMX 表情 `風場範囲` 映射 `2 - 80`，`風力倍率` 映射 `0 - 4` 倍并乘在面板基础强度之上，`減衰核心` 映射 `0.05 - 0.95`；可先用约 `23% / 25% / 33%`，其中倍率 `25% = 1x`、`0% = 0x`。
+10. 需要多个局部风源时，可重复加载同一个 PMX；面板底部会显示 `PMX已连接 N`。每个副本的控制骨骼和三个表情均可独立 K 帧。
+11. 两个风源覆盖同一刚体时会同时参与计算：同方向相加，反方向抵消；超过安全范围后统一限幅，不会重复写入 Bullet。
+12. 三个 PMX 表情和控制骨骼都可使用 MMD 原生注册按钮 K 帧；其余风力参数继续使用面板底部 JSON 轨道。
+13. 分别调整风力强度、阵风幅度、噪波强度和变化频率。
+14. 涡旋风使用方向作为旋转轴，使用中心作为旋涡中心；径向风、热上升气流、下击暴流和风切变会使用中心坐标。
+15. 切换到目标页，先选择 `风力层 / 阻尼层 / 重力层`，再复选该层使用的碰撞组或刚体；按住 `Shift` 点击可连续选择一段刚体。
+16. 切换其他作用层并设置不同目标；输入分组名称可以保存和复用当前选择。
+17. 切换到刚体页，可覆盖目标的线性阻尼、角阻尼与重力。
+18. 移动 MMD 时间轴到目标帧，调整参数后点击设置关键帧；在底部轨道点击菱形标记可选择或删除关键帧。
+
+建议第一次测试先使用 `Strength 15-35`、`Gust 10-25%`，方向设为 `1, 0, 0`。阻尼可从 `5-20%` 开始；较高阻尼会快速压制头发或裙摆摆动。`狂暴风`与接近 `1000` 的手动强度用于夸张镜头，轻质刚体会被迅速加速；PMX 倍率全开时组合强度最高可到 `4000`。
+
+## 安装与恢复
+
+先运行构建脚本生成 `dist`，然后安装实时加载链：
 
 ```powershell
 pwsh -File .\scripts\Install-WindTool.ps1 -MmdDirectory "D:\MikuMikuDance"
 ```
 
-卸载并恢复原始 MME：
+恢复原始 MMEffect：
 
 ```powershell
 pwsh -File .\scripts\Uninstall-WindTool.ps1 -MmdDirectory "D:\MikuMikuDance"
 ```
 
-启动 MMD 后，从 `WindTool > 打开 WindTool` 打开面板。轨道默认保存在：
+原始 MMEffect 会以 `MMEffect.original.dll` 保留，卸载过程可逆。
+
+部署脚本还会安装可视化风源：
 
 ```text
-<MMD目录>\PhysicsControlStudio\PhysicsControlStudio.json
+MikuMikuDance -2\WindTool\WindTool-WindSource.pmx
 ```
 
-## License
+## 导出接口
 
-WindTool 源码以 [MIT License](LICENSE) 发布。
+```text
+MmdPhysicsGetApiVersion
+MmdPhysicsInstall
+MmdPhysicsInstallForWindow
+MmdPhysicsUninstall
+MmdPhysicsIsInstalled
+MmdPhysicsGetStatusJsonW
+MmdPhysicsGetPanelWindow
+MmdPhysicsDispatchCommand
+MmdPhysicsOnFrameBoundary
+```
 
-
-By 克里斯提亚娜 2026.8.7
+API 版本仍为 `0x00010001`，现有 MME 转发器接口保持兼容。

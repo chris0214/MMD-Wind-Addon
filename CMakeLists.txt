@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(WindTool VERSION 0.1.0 LANGUAGES CXX)
+project(WindTool VERSION 0.4.1 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "WindTool targets MikuMikuDance on 64-bit Windows.")
@@ -64,6 +64,11 @@ set_target_properties(
     MmdPhysicsControlStudio
     PROPERTIES PREFIX "" OUTPUT_NAME "MmdPhysicsControlStudio")
 
+add_executable(
+    generate_wind_source_pmx
+    tools/generate_wind_source_pmx.cpp)
+windtool_configure_target(generate_wind_source_pmx)
+
 if(WINDTOOL_BUILD_FORWARDER)
     add_library(
         PhysicsMMEffectForwarder SHARED
@@ -80,6 +85,8 @@ endif()
 if(MINGW)
     target_link_options(
         MmdPhysicsControlStudio PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(
+        generate_wind_source_pmx PRIVATE -static -static-libgcc -static-libstdc++)
     if(WINDTOOL_BUILD_FORWARDER)
         target_link_options(
             PhysicsMMEffectForwarder
@@ -140,12 +147,22 @@ if(WINDTOOL_BUILD_TESTS)
     add_test(
         NAME windtool_ui_surrogate
         COMMAND windtool_ui_surrogate $<TARGET_FILE:MmdPhysicsControlStudioSurrogate>)
+    add_test(
+        NAME windtool_wind_source_pmx_fixture
+        COMMAND generate_wind_source_pmx
+            "${CMAKE_CURRENT_BINARY_DIR}/WindTool-WindSource.fixture.pmx")
 endif()
 
 install(
     TARGETS MmdPhysicsControlStudio
     RUNTIME DESTINATION PhysicsControlStudio
     LIBRARY DESTINATION PhysicsControlStudio)
+
+install(
+    FILES
+        "${CMAKE_CURRENT_LIST_DIR}/assets/WindTool-WindSource.pmx"
+        "${CMAKE_CURRENT_LIST_DIR}/assets/README.md"
+    DESTINATION WindTool)
 
 if(WINDTOOL_BUILD_FORWARDER)
     install(

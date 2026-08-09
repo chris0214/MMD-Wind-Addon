@@ -29,19 +29,25 @@ float length_squared(const Vec3& value) noexcept {
     return value.x * value.x + value.y * value.y + value.z * value.z;
 }
 
+bool valid_target(const TargetSelection& target) noexcept {
+    const bool kind_valid =
+        target.kind == TargetKind::AllDynamic ||
+        (target.kind == TargetKind::CollisionGroup && target.index < 16) ||
+        (target.kind == TargetKind::RigidBody && target.index < 65'536) ||
+        target.kind == TargetKind::CustomSet;
+    const bool bodies_valid = std::all_of(
+        target.rigid_body_indices.begin(),
+        target.rigid_body_indices.end(),
+        [](std::uint32_t index) { return index < 65'536; });
+    return kind_valid && bodies_valid;
+}
+
 }  // namespace
 
 bool validate_physics_settings(const PhysicsSettings& settings) noexcept {
-    const bool target_valid =
-        settings.target.kind == TargetKind::AllDynamic ||
-        (settings.target.kind == TargetKind::CollisionGroup && settings.target.index < 16) ||
-        (settings.target.kind == TargetKind::RigidBody && settings.target.index < 65'536) ||
-        settings.target.kind == TargetKind::CustomSet;
-    const bool custom_bodies_valid = std::all_of(
-        settings.target.rigid_body_indices.begin(),
-        settings.target.rigid_body_indices.end(),
-        [](std::uint32_t index) { return index < 65'536; });
-    return target_valid && custom_bodies_valid && finite(settings.linear_damping) &&
+    return valid_target(settings.wind_target) &&
+        valid_target(settings.damping_target) &&
+        valid_target(settings.gravity_target) && finite(settings.linear_damping) &&
         settings.linear_damping >= 0.0f && settings.linear_damping <= 1.0f &&
         finite(settings.angular_damping) && settings.angular_damping >= 0.0f &&
         settings.angular_damping <= 1.0f && finite(settings.gravity_direction) &&
@@ -85,6 +91,9 @@ ControlSnapshot interpolate_control_snapshots(
     result.wind.turbulence = lerp(first.wind.turbulence, second.wind.turbulence, t);
     result.wind.frequency = lerp(first.wind.frequency, second.wind.frequency, t);
     result.wind.center = lerp(first.wind.center, second.wind.center, t);
+    result.wind.radius = lerp(first.wind.radius, second.wind.radius, t);
+    result.wind.core_ratio = lerp(
+        first.wind.core_ratio, second.wind.core_ratio, t);
     result.wind.maximum_speed = lerp(
         first.wind.maximum_speed, second.wind.maximum_speed, t);
     result.physics.linear_damping = lerp(
@@ -95,20 +104,23 @@ ControlSnapshot interpolate_control_snapshots(
         first.physics.gravity_direction, second.physics.gravity_direction, t);
     result.physics.gravity_acceleration = lerp(
         first.physics.gravity_acceleration, second.physics.gravity_acceleration, t);
+    normalize_wind_settings(result.wind);
     return result;
 }
 
 void PhysicsTrack::set_key(std::uint32_t frame, const ControlSnapshot& value) {
+    ControlSnapshot normalized = value;
+    normalize_wind_settings(normalized.wind);
     const auto found = std::lower_bound(
         keys_.begin(), keys_.end(), frame,
         [](const ControlKeyframe& key, std::uint32_t value_frame) {
             return key.frame < value_frame;
         });
     if (found != keys_.end() && found->frame == frame) {
-        found->value = value;
+        found->value = normalized;
         return;
     }
-    keys_.insert(found, ControlKeyframe{frame, value});
+    keys_.insert(found, ControlKeyframe{frame, normalized});
 }
 
 bool PhysicsTrack::erase_key(std::uint32_t frame) noexcept {

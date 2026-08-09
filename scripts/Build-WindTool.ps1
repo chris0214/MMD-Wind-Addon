@@ -34,6 +34,17 @@ if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
 & cmake --build $BuildDirectory --config $Configuration --parallel
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 
+$windSourceGenerator = if ($selectedGenerator -eq 'Ninja') {
+    Join-Path $BuildDirectory 'generate_wind_source_pmx.exe'
+} else {
+    Join-Path $BuildDirectory "$Configuration\generate_wind_source_pmx.exe"
+}
+if (-not (Test-Path -LiteralPath $windSourceGenerator -PathType Leaf)) {
+    throw "Wind source generator was not found: $windSourceGenerator"
+}
+& $windSourceGenerator (Join-Path $projectDirectory 'assets\WindTool-WindSource.pmx')
+if ($LASTEXITCODE -ne 0) { throw 'Wind source PMX generation failed.' }
+
 & ctest --test-dir $BuildDirectory -C $Configuration --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
 

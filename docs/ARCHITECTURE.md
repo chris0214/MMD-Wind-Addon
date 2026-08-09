@@ -37,8 +37,10 @@ validated velocity/damping fields using the following version-locked offsets:
 ```text
 world position                +0x40
 interpolation linear velocity +0x90
+interpolation angular velocity +0xA0
 activation state              +0xEC
 solver linear velocity        +0x150
+solver angular velocity       +0x160
 linear damping                +0x1F0
 angular damping               +0x1F4
 ```
@@ -50,6 +52,16 @@ paused.
 
 Target gravity is implemented as a per-frame velocity compensation against
 MMD's native gravity. WindTool does not replace or own the global Bullet world.
+
+Wind, damping and gravity each carry an independent target selection. A target
+can be all dynamic bodies, one collision group, one rigid body, or a custom set
+combining multiple groups and bodies.
+
+When wind stops, the runtime queues the previous wind-target set by model rather
+than trusting the current UI target. For a bounded number of refreshes it clears
+solver linear/angular velocity and both Bullet interpolation velocity fields, so
+a target change, model switch, master-off event or live strength of zero cannot
+leave an old visual wind velocity behind.
 
 ## Write safety
 
@@ -70,7 +82,9 @@ values already changed during that frame. Unsupported hosts fail closed.
 WindTool deliberately does not modify PMM files. Keyframes and named target
 groups are stored in `PhysicsControlStudio.json` beside the installed plugin.
 Numeric controls interpolate linearly; switches, field types and target sets use
-step interpolation.
+step interpolation. Version 2 stores independent wind, damping and gravity
+targets. Version 1 documents are accepted and their shared target is copied into
+all three layers during loading.
 
 ## Extension boundaries
 
